@@ -1,0 +1,21 @@
+import puppeteer from 'puppeteer';
+(async () => {
+  const browser = await puppeteer.launch({ args: ['--no-sandbox', '--disable-setuid-sandbox'] });
+  const page = await browser.newPage();
+  page.on('console', msg => console.log('Console:', msg.text()));
+  page.on('pageerror', err => console.log('PageError:', err.message));
+  
+  await page.evaluateOnNewDocument(() => {
+    const originalFetch = window.fetch;
+    Object.defineProperty(window, 'fetch', {
+      get: () => originalFetch,
+      set: (val) => {
+        console.error("SOMEONE TRIED TO SET FETCH!");
+      }
+    });
+  });
+
+  await page.goto('http://localhost:3000');
+  await new Promise(r => setTimeout(r, 2000));
+  await browser.close();
+})();

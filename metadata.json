@@ -1,0 +1,8 @@
+{
+  "name": "Hanger Hub TeleCRM",
+  "description": "Multi-user TeleCRM and Lead Management application for Hanger Hub Ceiling Hanger.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
