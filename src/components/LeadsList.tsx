@@ -1,10 +1,12 @@
+import { syncLeadToGoogleCalendar } from '../lib/googleAuth.ts';
 import React, { useEffect, useState, useRef } from 'react';
 import type { User, Lead, LeadStatus } from '../types.ts';
-import { Plus, X, Edit, MessageSquare, Bot, Loader2, Search, Download, History, CalendarClock, LayoutGrid, List as ListIcon, CheckCircle2, FileText, Flame, Upload } from 'lucide-react';
+import { Plus, X, Edit, MessageSquare, Bot, Loader2, Search, Download, History, CalendarClock, LayoutGrid, List as ListIcon, CheckCircle2, FileText, Flame, Upload, ChevronDown, ChevronUp, Save, Printer, MapPin } from 'lucide-react';
 import KanbanBoard from './KanbanBoard.tsx';
 import WhatsappChatDrawer from './WhatsappChatDrawer';
 import type { PipelineStage } from '../types.ts';
 import Papa from 'papaparse';
+import LeadMap from './LeadMap.tsx';
 
 export default function LeadsList({ user, token }: { user: User, token: string }) {
   const [leads, setLeads] = useState<Lead[]>([]);
@@ -24,7 +26,7 @@ export default function LeadsList({ user, token }: { user: User, token: string }
   // Filtering state
   const [sortBy, setSortBy] = useState<'priority' | 'followUp' | 'recent'>('priority');
   const [searchTerm, setSearchTerm] = useState('');
-  const [viewMode, setViewMode] = useState<'table' | 'kanban'>('table');
+  const [viewMode, setViewMode] = useState<'table' | 'kanban' | 'map'>('table');
   const [stages, setStages] = useState<PipelineStage[]>([]);
   const [statusFilter, setStatusFilter] = useState<LeadStatus | 'All'>('All');
   const [assigneeFilter, setAssigneeFilter] = useState<number | 'All'>('All');
@@ -42,8 +44,61 @@ export default function LeadsList({ user, token }: { user: User, token: string }
   const [noteLeadId, setNoteLeadId] = useState<number | null>(null);
   const [noteText, setNoteText] = useState('');
   const [noteLoading, setNoteLoading] = useState(false);
+  const [expandedNotesId, setExpandedNotesId] = useState<number | null>(null);
+  const [expandedNoteText, setExpandedNoteText] = useState('');
+  const [isSavingExpandedNote, setIsSavingExpandedNote] = useState(false);
+  
+  const toggleExpandedNote = (lead: Lead) => {
+    if (expandedNotesId === lead.id) {
+      setExpandedNotesId(null);
+    } else {
+      setExpandedNotesId(lead.id);
+      setExpandedNoteText(typeof lead.notes === 'string' ? lead.notes : JSON.stringify(lead.notes || []));
+    }
+  };
+
+  const autoSaveTimerRef2 = useRef<NodeJS.Timeout | null>(null);
+
+  useEffect(() => {
+    if (expandedNotesId !== null && expandedNoteText !== undefined) {
+      if (autoSaveTimerRef2.current) {
+        clearTimeout(autoSaveTimerRef2.current);
+      }
+      autoSaveTimerRef2.current = setTimeout(async () => {
+        setIsSavingExpandedNote(true);
+        try {
+          const res = await fetch(`/api/leads/${expandedNotesId}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ notes: expandedNoteText })
+          });
+          if (res.ok) {
+            setLeads(prev => prev.map(l => l.id === expandedNotesId ? { ...l, notes: expandedNoteText } : l));
+          }
+        } catch (e) {
+          console.error(e);
+        } finally {
+          setIsSavingExpandedNote(false);
+        }
+      }, 500);
+    }
+    return () => {
+      if (autoSaveTimerRef2.current) clearTimeout(autoSaveTimerRef2.current);
+    };
+  }, [expandedNoteText, expandedNotesId]);
+
+
 
   
+  
+  const getPriorityColor = (priority?: string) => {
+    switch (priority) {
+      case 'High': return 'border-l-rose-500 bg-rose-50 dark:bg-rose-950/30 text-rose-700 dark:text-rose-400';
+      case 'Low': return 'border-l-blue-500 bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-400';
+      default: return 'border-l-amber-500 bg-amber-50 dark:bg-amber-950/30 text-amber-700 dark:text-amber-400';
+    }
+  };
+
   const handleSelectAll = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.checked) {
       setSelectedLeadIds(sortedLeads.map(l => l.id));
@@ -393,7 +448,8 @@ export default function LeadsList({ user, token }: { user: User, token: string }
             body: JSON.stringify({ leads: results.data })
           });
           if (res.ok) {
-            alert('Leads imported successfully');
+            const data = await res.json();
+            alert(`Imported ${data.count} leads successfully.${data.skipped > 0 ? ` Skipped ${data.skipped} duplicate leads (matching mobile numbers).` : ''}`);
             fetchLeads();
           } else {
             alert('Failed to import leads');
@@ -409,11 +465,13 @@ export default function LeadsList({ user, token }: { user: User, token: string }
   };
 
   const handleExportCSV = () => {
-    const headers = ['ID', 'Client Name', 'Contact', 'Product', 'Quantity', 'Price', 'Status', 'Next Follow-up', 'Install Date'];
+    const headers = ['ID', 'Client Name', 'Contact', 'Email', 'Tags', 'Product', 'Quantity', 'Price', 'Status', 'Next Follow-up', 'Install Date'];
     const rows = filteredLeads.map(l => [
       l.id,
       `"${l.clientName}"`,
       `"${l.contact}"`,
+      `"${l.email || ''}"`,
+      `"${(l.tags || []).join(', ')}"`,
       `"${l.requiredProduct || ''}"`,
       `"${l.quantity || ''}"`,
       `"${l.price || ''}"`,
@@ -435,7 +493,8 @@ export default function LeadsList({ user, token }: { user: User, token: string }
     const searchLower = searchTerm.toLowerCase();
     const matchesSearch = 
       lead.clientName.toLowerCase().includes(searchLower) || 
-      lead.contact.toLowerCase().includes(searchLower);
+      lead.contact.toLowerCase().includes(searchLower) ||
+      (lead.email || '').toLowerCase().includes(searchLower);
     const matchesStatus = statusFilter === 'All' || lead.status === statusFilter;
     const matchesAssignee = assigneeFilter === 'All' || lead.assignedUserId === assigneeFilter;
     return matchesSearch && matchesStatus && matchesAssignee;
@@ -492,6 +551,60 @@ export default function LeadsList({ user, token }: { user: User, token: string }
 
   return (
     <div className="space-y-4 sm:space-y-6 relative pb-20 sm:pb-0">
+      
+      
+      {selectedLeadIds.length > 0 && user.role !== 'Technician' && (
+        <div className="no-print sticky top-0 z-50 mb-4 bg-indigo-50 dark:bg-indigo-900/40 border border-indigo-200 dark:border-indigo-800 rounded-xl p-3 shadow-md flex flex-wrap items-center gap-4 animate-in fade-in slide-in-from-top-4">
+          <span className="text-sm font-semibold text-indigo-800 dark:text-indigo-300">
+            {selectedLeadIds.length} lead(s) selected
+          </span>
+          <div className="flex gap-2">
+            <select
+              value={bulkStatus}
+              onChange={e => setBulkStatus(e.target.value)}
+              className="text-sm bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="">Update Status...</option>
+              {stages.map(s => <option key={s.id} value={s.name}>{s.name}</option>)}
+            </select>
+            <select
+              value={bulkTechId}
+              onChange={e => setBulkTechId(e.target.value)}
+              className="text-sm bg-white dark:bg-zinc-800 border border-zinc-200 dark:border-zinc-700 rounded-lg px-3 py-1.5 focus:ring-2 focus:ring-indigo-500"
+            >
+              <option value="">Assign Tech...</option>
+              {users.filter(u => u.role === 'Technician').map(u => <option key={u.id} value={u.id}>{u.username}</option>)}
+            </select>
+            <button
+              onClick={handleBulkUpdate}
+              disabled={!bulkStatus && !bulkTechId}
+              className="bg-indigo-600 text-white px-4 py-1.5 rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+            >
+              Apply Updates
+            </button>
+            <button
+              onClick={() => setSelectedLeadIds([])}
+              className="text-zinc-500 hover:text-zinc-700 dark:hover:text-zinc-300 px-2 py-1.5 text-sm"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* Summary Cards */}
+      <div className="no-print grid grid-cols-2 md:grid-cols-4 gap-3 sm:gap-4">
+        {['New', 'Follow Up', 'Qualified', 'Closed'].map(status => {
+          const count = leads.filter(l => l.status === status).length;
+          return (
+            <div key={status} className="bg-white dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 rounded-xl p-4 shadow-sm flex flex-col justify-between transition-colors">
+              <span className="text-xs font-semibold text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">{status} Leads</span>
+              <span className="text-2xl font-bold text-zinc-900 dark:text-white mt-1">{count}</span>
+            </div>
+          );
+        })}
+      </div>
+
       <div className="flex flex-col lg:flex-row gap-4 justify-between items-start lg:items-center">
         <div>
           <h2 className="text-xl sm:text-2xl font-bold text-zinc-900 dark:text-white">Lead Pipeline</h2>
@@ -513,6 +626,12 @@ export default function LeadsList({ user, token }: { user: User, token: string }
               className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium flex items-center justify-center gap-1.5 transition-colors ${viewMode === 'kanban' ? 'bg-indigo-50 dark:bg-indigo-950/70 text-indigo-700 dark:text-indigo-300 font-semibold' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'}`}
             >
               <LayoutGrid className="w-4 h-4" /> Kanban
+            </button>
+            <button 
+              onClick={() => setViewMode('map')}
+              className={`flex-1 sm:flex-none px-3 py-1.5 rounded-md text-xs sm:text-sm font-medium flex items-center justify-center gap-1.5 transition-colors ${viewMode === 'map' ? 'bg-indigo-50 dark:bg-indigo-950/70 text-indigo-700 dark:text-indigo-300 font-semibold' : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100'}`}
+            >
+              <MapPin className="w-4 h-4" /> Map
             </button>
           </div>
           
@@ -584,7 +703,15 @@ export default function LeadsList({ user, token }: { user: User, token: string }
               </label>
             )}
 
-            {!isTechnician && (
+            
+            <button
+              onClick={() => window.print()}
+              className="no-print flex-1 sm:flex-none flex items-center justify-center gap-1.5 px-3 sm:px-4 py-2 bg-white dark:bg-zinc-900 text-zinc-700 dark:text-zinc-300 rounded-lg text-xs sm:text-sm font-medium hover:bg-zinc-50 dark:hover:bg-zinc-800 transition-colors border border-zinc-200 dark:border-zinc-800 shadow-sm whitespace-nowrap"
+            >
+              <Printer className="w-4 h-4" />
+              Print
+            </button>
+{!isTechnician && (
               <button
                 onClick={() => openModal()}
                 className="hidden md:flex flex-1 sm:flex-none items-center justify-center gap-1.5 px-4 py-2 bg-indigo-600 text-white rounded-lg text-xs sm:text-sm font-medium hover:bg-indigo-700 transition-colors shadow-xs whitespace-nowrap"
@@ -815,8 +942,10 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-zinc-200 dark:divide-zinc-800">
+                  
                   {sortedLeads.map(lead => (
-                    <tr key={lead.id} className="hover:bg-zinc-50 dark:hover:bg-zinc-800/50 text-sm transition-colors">
+                    <React.Fragment key={lead.id}>
+                    <tr className={`group hover:bg-zinc-50 dark:hover:bg-zinc-800/80 hover:shadow-sm hover:-translate-y-0.5 text-sm transition-all duration-200 border-l-4 ${getPriorityColor(lead.priority).split(' ')[0]} ${expandedNotesId === lead.id ? 'bg-zinc-50 dark:bg-zinc-800/30 border-indigo-500' : ''}`}>
                       {user.role !== 'Technician' && (
                         <td className="px-5 py-3.5">
                           <input 
@@ -828,8 +957,22 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                         </td>
                       )}
                       <td className="px-5 py-3.5">
-                        <div className="font-semibold text-zinc-900 dark:text-zinc-100">{lead.clientName}</div>
-                        <div className="text-zinc-500 dark:text-zinc-400 text-xs">{lead.contact}</div>
+                        <div className="font-semibold text-zinc-900 dark:text-zinc-100 flex items-center gap-2">
+                          {lead.clientName}
+                          <span className={`no-print px-1.5 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${getPriorityColor(lead.priority)}`}>
+                            {lead.priority || 'Medium'}
+                          </span>
+                        </div>
+                        <div className="text-zinc-500 dark:text-zinc-400 text-xs mt-0.5">{lead.contact} {lead.email ? `• ${lead.email}` : ''}</div>
+                        {lead.tags && lead.tags.length > 0 && (
+                           <div className="flex flex-wrap gap-1 mt-1.5">
+                             {lead.tags.map(tag => (
+                               <span key={tag} className="px-1.5 py-0.5 rounded bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 text-[10px] font-medium">
+                                 {tag}
+                               </span>
+                             ))}
+                           </div>
+                        )}
                       </td>
                       <td className="px-5 py-3.5">
                         <div className="text-zinc-900 dark:text-zinc-100 font-medium">{lead.requiredProduct || '-'}</div>
@@ -841,9 +984,29 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                           {calculateHotness(lead) >= 50 ? <Flame className="w-4 h-4 text-rose-500" /> : calculateHotness(lead) >= 30 ? <Flame className="w-4 h-4 text-orange-400" /> : <Flame className="w-4 h-4 text-zinc-300 dark:text-zinc-600" />}
                           <span className="text-xs font-bold text-zinc-700 dark:text-zinc-300">Score: {calculateHotness(lead)}</span>
                         </div>
+
                         <span className="inline-flex items-center px-2 py-0.5 rounded-md text-xs font-medium bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300">
                           {lead.status}
                         </span>
+                        
+
+                        {lead.techAssignmentStatus === 'Pending' && (
+                          <div className={`mt-1 inline-flex items-center px-2 py-0.5 rounded ${isSlaBreached(lead) ? 'bg-rose-100 dark:bg-rose-900/60 text-rose-800 dark:text-rose-300 border-rose-300 dark:border-rose-700 animate-pulse' : 'bg-amber-50 dark:bg-amber-900/40 text-[10px] font-medium text-amber-700 dark:text-amber-400 border border-amber-200 dark:border-amber-800'}`}>
+                            {isSlaBreached(lead) ? '⚠️ SLA Breached (30m+)' : 'Tech Pending'}
+                          </div>
+                        )}
+                        {lead.techAssignmentStatus === 'Declined' && (
+                          <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded bg-red-50 dark:bg-red-900/40 text-[10px] font-medium text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800">
+                            Tech Declined
+                          </div>
+                        )}
+                        {lead.techAssignmentStatus === 'Accepted' && (
+                          <div className="mt-1 inline-flex items-center px-2 py-0.5 rounded bg-emerald-50 dark:bg-emerald-900/40 text-[10px] font-medium text-emerald-700 dark:text-emerald-400 border border-emerald-200 dark:border-emerald-800">
+                            Tech Confirmed
+                          </div>
+                        )}
+
+
                         {lead.nextFollowUp && (
                           <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1 flex items-center gap-1">
                             <CalendarClock className="w-3 h-3 text-indigo-500 dark:text-indigo-400" /> 
@@ -852,16 +1015,12 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                         )}
                       </td>
                       <td className="px-5 py-3.5 text-right whitespace-nowrap">
-                        <button 
-                          onClick={() => {
-                            setNoteLeadId(lead.id);
-                            setIsNoteModalOpen(true);
-                            setNoteText('');
-                          }}
-                          className="text-zinc-400 dark:text-zinc-500 hover:text-indigo-600 dark:hover:text-indigo-400 p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors mr-1"
-                          title="Quick Note"
+                        <button
+                          onClick={() => toggleExpandedNote(lead)}
+                          className={`text-zinc-400 dark:text-zinc-500 hover:text-indigo-600 dark:hover:text-indigo-400 p-1.5 rounded-lg hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors mr-1 ${expandedNotesId === lead.id ? 'bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600' : ''}`}
+                          title="Expand Notes"
                         >
-                          <FileText className="w-4 h-4" />
+                          {expandedNotesId === lead.id ? <ChevronUp className="w-4 h-4" /> : <FileText className="w-4 h-4" />}
                         </button>
                         <button 
                           onClick={() => openModal(lead)}
@@ -871,7 +1030,34 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                           <Edit className="w-4 h-4" />
                         </button>
                       </td>
-                    </tr>
+                                        </tr>
+                    {expandedNotesId === lead.id && (
+                      <tr className="bg-zinc-50/50 dark:bg-zinc-800/30 border-l-2 border-indigo-500">
+                        <td colSpan={user.role !== 'Technician' ? 6 : 5} className="px-5 py-4">
+                          <div className="flex flex-col gap-2 max-w-3xl ml-auto mr-auto w-full">
+                            <label className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">Quick Notes</label>
+                            <textarea
+                              className="w-full h-24 p-3 border border-zinc-200 dark:border-zinc-700 rounded-lg bg-white dark:bg-zinc-900 text-sm text-zinc-900 dark:text-zinc-100 placeholder-zinc-400 focus:outline-none focus:ring-2 focus:ring-indigo-500 resize-none transition-shadow"
+                              placeholder="Add notes for this lead..."
+                              value={expandedNoteText}
+                              onChange={e => setExpandedNoteText(e.target.value)}
+                            />
+                            <div className="flex justify-between items-center gap-2">
+                              <div className="text-xs text-zinc-500 flex items-center gap-1.5">
+                                {isSavingExpandedNote ? <><Loader2 className="w-3 h-3 animate-spin" /> Saving...</> : <><CheckCircle2 className="w-3 h-3 text-emerald-500" /> Auto-saved</>}
+                              </div>
+                              <button
+                                onClick={() => setExpandedNotesId(null)}
+                                className="px-3 py-1.5 text-xs font-medium bg-zinc-100 dark:bg-zinc-800 text-zinc-700 dark:text-zinc-300 rounded hover:bg-zinc-200 dark:hover:bg-zinc-700 transition-colors"
+                              >
+                                Close
+                              </button>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                    </React.Fragment>
                   ))}
                   {sortedLeads.length === 0 && (
                     <tr>
@@ -1026,6 +1212,23 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                       className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 rounded-lg text-xs sm:text-sm disabled:bg-zinc-100 dark:disabled:bg-zinc-800/50 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
                       value={editingLead.contact || ''}
                       onChange={e => setEditingLead({...editingLead, contact: e.target.value})}
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">Email</label>
+                    <input type="email" disabled={isTechnician}
+                      className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 rounded-lg text-xs sm:text-sm disabled:bg-zinc-100 dark:disabled:bg-zinc-800/50 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                      value={editingLead.email || ''}
+                      onChange={e => setEditingLead({...editingLead, email: e.target.value})}
+                    />
+                  </div>
+                  <div className="sm:col-span-2">
+                    <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">Tags (comma-separated)</label>
+                    <input type="text" disabled={isTechnician}
+                      placeholder="e.g. Cold Call, Referral, Web Inquiry"
+                      className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-800 text-zinc-900 dark:text-zinc-100 rounded-lg text-xs sm:text-sm disabled:bg-zinc-100 dark:disabled:bg-zinc-800/50 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                      value={editingLead.tags?.join(', ') || ''}
+                      onChange={e => setEditingLead({...editingLead, tags: e.target.value.split(',').map(t => t.trim()).filter(Boolean)})}
                     />
                   </div>
                   <div>

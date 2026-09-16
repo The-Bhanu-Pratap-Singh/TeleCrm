@@ -1,3 +1,4 @@
+import { syncLeadToGoogleCalendar } from '../lib/googleAuth.ts';
 
 import React, { useEffect, useState, useMemo } from 'react';
 import type { User, Lead, ActivityLog, Attendance, Task } from '../types.ts';
@@ -6,6 +7,7 @@ import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, AreaChart, Area, Cell } from 'recharts';
 import { useTheme } from '../context/ThemeContext.tsx';
+import { ThumbsUp, ThumbsDown, AlertCircle } from 'lucide-react';
 
 interface DashboardProps {
 
@@ -21,7 +23,34 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
   const [activities, setActivities] = useState<ActivityLog[]>([]);
   
   const dashboardRef = React.useRef<HTMLDivElement>(null);
+  
   const [isExporting, setIsExporting] = useState(false);
+  const [actionLoading, setActionLoading] = useState<number | null>(null);
+
+  const pendingLeads = useMemo(() => {
+    return leads.filter(l => l.pendingTechId === user.id && l.techAssignmentStatus === 'Pending');
+  }, [leads, user.id]);
+
+  const handleTechAction = async (leadId: number, action: 'accept-tech' | 'decline-tech') => {
+    try {
+      setActionLoading(leadId);
+      const res = await fetch(`/api/leads/${leadId}/${action}`, {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.ok) {
+        // Refresh leads
+        const leadsRes = await fetch('/api/leads', { headers: { 'Authorization': `Bearer ${token}` }});
+        const data = await leadsRes.json();
+        setLeads(data);
+      }
+    } catch (e) {
+      console.error(e);
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
 
   const exportPDF = async () => {
     if (!dashboardRef.current) return;
@@ -37,7 +66,8 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
       pdf.save('dashboard-report.pdf');
     } catch (err) {
       console.error('Error generating PDF:', err);
-      alert('Failed to generate PDF');
+      console.error('EXPORT_ERROR:', err);
+      alert('Failed to generate PDF: ' + (err.message || String(err)));
     } finally {
       setIsExporting(false);
     }
@@ -47,30 +77,36 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
   const [stages, setStages] = useState<{name: string, orderIndex: number}[]>([]);
   
   useEffect(() => {
-    fetch('/api/stages', { headers: { 'Authorization': `Bearer ${token}` } })
-      .then(r => r.json())
-      .then(data => { if (Array.isArray(data)) setStages(data); })
-      .catch(console.error);
-    
-    fetch('/api/leads', {
-      headers: { 'Authorization': `Bearer ${token}` }
-    })
-    .then(r => r.json())
-    .then(data => {
-      if (Array.isArray(data)) setLeads(data);
-    })
-    .catch(console.error);
-
-    if (user.role === 'Admin') {
-      fetch('/api/activity', {
+    const fetchAllData = () => {
+      fetch('/api/stages', { headers: { 'Authorization': `Bearer ${token}` } })
+        .then(r => r.json())
+        .then(data => { if (Array.isArray(data)) setStages(data); })
+        .catch(console.error);
+      
+      fetch('/api/leads', {
         headers: { 'Authorization': `Bearer ${token}` }
       })
       .then(r => r.json())
       .then(data => {
-        if (Array.isArray(data)) setActivities(data);
+        if (Array.isArray(data)) setLeads(data);
       })
       .catch(console.error);
-    }
+
+      if (user.role === 'Admin') {
+        fetch('/api/activity', {
+          headers: { 'Authorization': `Bearer ${token}` }
+        })
+        .then(r => r.json())
+        .then(data => {
+          if (Array.isArray(data)) setActivities(data);
+        })
+        .catch(console.error);
+      }
+    };
+    
+    fetchAllData();
+    const interval = setInterval(fetchAllData, 10000);
+    return () => clearInterval(interval);
   }, [token, user.role]);
 
   const todayStr = new Date().toISOString().split('T')[0];
@@ -177,7 +213,7 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
         <button 
           onClick={exportPDF} 
           disabled={isExporting}
-          className="flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 transition-colors"
+          className="no-print flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg text-sm font-medium hover:bg-indigo-700 disabled:opacity-50 transition-colors"
         >
           {isExporting ? <span className="animate-spin text-sm">...</span> : <Download className="w-4 h-4" />}
           {isExporting ? 'Generating...' : 'Export Report'}

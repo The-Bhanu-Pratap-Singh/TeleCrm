@@ -4,24 +4,30 @@
  */
 
 import { useEffect, useState } from 'react';
-import { LayoutDashboard, Users, ClipboardList, LogOut, Loader2, Menu, X, Plus, Activity } from 'lucide-react';
+import { LayoutDashboard, Users, ClipboardList, LogOut, Loader2, Menu, X, Plus, Activity, Calendar } from 'lucide-react';
 import Login from './components/Login.tsx';
 import Dashboard from './components/Dashboard.tsx';
+import TechnicianDashboard from './components/TechnicianDashboard.tsx';
 import LeadsList from './components/LeadsList.tsx';
 import AdminPanel from './components/AdminPanel.tsx';
+import CalendarAppView from './components/CalendarAppView.tsx';
 import ActivityLogViewer from './components/ActivityLogViewer.tsx';
 import ThemeToggle from './components/ThemeToggle.tsx';
+import { io, Socket } from 'socket.io-client';
+import ChatWidget from './components/ChatWidget.tsx';
+import NotificationBell from './components/NotificationBell.tsx';
 import type { User } from './types.ts';
 
 export default function App() {
   const [token, setToken] = useState<string | null>(''); // Kept state to prevent prop errors, but unused for auth
   const [user, setUser] = useState<User | null>(null);
-  const [currentView, setCurrentView] = useState<'dashboard' | 'leads' | 'users' | 'activity'>('dashboard');
+  const [currentView, setCurrentView] = useState<'dashboard' | 'leads' | 'users' | 'activity' | 'calendar'>('dashboard');
   const [loading, setLoading] = useState(true);
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
 
   const [showSessionWarning, setShowSessionWarning] = useState(false);
   const [sessionExp, setSessionExp] = useState<number | null>(null);
+  const [socket, setSocket] = useState<Socket | null>(null);
 
 
   useEffect(() => {
@@ -44,6 +50,20 @@ export default function App() {
     };
     verifySession();
   }, []);
+
+
+  useEffect(() => {
+    if (!user) return;
+    const newSocket = io({
+      withCredentials: true,
+      transports: ['websocket', 'polling']
+    });
+    setSocket(newSocket);
+    
+    return () => {
+      newSocket.close();
+    };
+  }, [user]);
 
   const handleLogin = (newToken: string, newUser: User) => {
     setUser(newUser);
@@ -101,7 +121,7 @@ export default function App() {
     setIsMobileMenuOpen(false);
   };
 
-  const handleNavigate = (view: 'dashboard' | 'leads' | 'users' | 'activity') => {
+  const handleNavigate = (view: 'dashboard' | 'leads' | 'users' | 'activity' | 'calendar') => {
     setCurrentView(view);
     setIsMobileMenuOpen(false);
   };
@@ -141,6 +161,9 @@ export default function App() {
             <p className="text-[11px] text-zinc-400 font-medium">TeleCRM</p>
           </div>
         </div>
+        <div className="flex items-center gap-2">
+           {user && socket && <NotificationBell user={user} socket={socket} token={token} />}
+        </div>
         
         <div className="flex items-center gap-1.5">
           <ThemeToggle variant="icon" />
@@ -179,13 +202,17 @@ export default function App() {
             <h1 className="text-xl md:text-2xl font-bold tracking-tight text-white">Hanger Hub</h1>
             <p className="text-xs md:text-sm text-zinc-400 mt-0.5">TeleCRM System</p>
           </div>
-          <button
-            onClick={() => setIsMobileMenuOpen(false)}
-            className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 md:hidden"
-            aria-label="Close menu"
-          >
-            <X className="w-5 h-5" />
-          </button>
+
+          <div className="flex items-center gap-2">
+            {user && socket && <NotificationBell user={user} socket={socket} />}
+            <button
+              onClick={() => setIsMobileMenuOpen(false)}
+              className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 md:hidden"
+              aria-label="Close menu"
+            >
+              <X className="w-5 h-5" />
+            </button>
+          </div>
         </div>
         
         <nav className="flex-1 px-4 space-y-1.5 mt-4 overflow-y-auto">
@@ -208,6 +235,17 @@ export default function App() {
             <ClipboardList className="w-5 h-5 flex-shrink-0" />
             <span>Leads Pipeline</span>
           </button>
+
+          <button 
+            onClick={() => handleNavigate('calendar')}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl text-sm font-medium transition-colors ${
+              currentView === 'calendar' ? 'bg-indigo-600 text-white shadow-sm' : 'text-zinc-300 hover:bg-zinc-800 dark:hover:bg-zinc-900 hover:text-white'
+            }`}
+          >
+            <Calendar className="w-5 h-5 flex-shrink-0" />
+            <span>Calendar</span>
+          </button>
+
 
           {user.role === 'Admin' && (
             <>
@@ -257,7 +295,8 @@ export default function App() {
       <main className="flex-1 flex flex-col min-w-0 h-screen overflow-hidden pt-16 md:pt-0">
         <div className="flex-1 overflow-y-auto overflow-x-hidden p-3 sm:p-5 md:p-6 lg:p-8 pb-20 md:pb-8">
           <div className="max-w-7xl mx-auto w-full">
-            {currentView === 'dashboard' && <Dashboard user={user} token={token} onNavigate={setCurrentView} />}
+            {currentView === 'dashboard' && user.role !== 'Technician' && <Dashboard user={user} token={token} onNavigate={setCurrentView} />}
+            {currentView === 'dashboard' && user.role === 'Technician' && <TechnicianDashboard user={user} token={token} />}
             {currentView === 'leads' && <LeadsList user={user} token={token} />}
             {currentView === 'users' && user.role === 'Admin' && <AdminPanel token={token} />}
             {currentView === 'activity' && user.role === 'Admin' && <ActivityLogViewer token={token} />}
@@ -285,6 +324,17 @@ export default function App() {
             <ClipboardList className="w-5 h-5 mb-0.5" />
             <span>Leads</span>
           </button>
+
+          <button
+            onClick={() => handleNavigate('calendar')}
+            className={`flex flex-col items-center justify-center py-1 px-3 rounded-lg text-xs font-medium transition-colors ${
+              currentView === 'calendar' ? 'text-indigo-400' : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Calendar className="w-5 h-5 mb-0.5" />
+            <span>Calendar</span>
+          </button>
+
 
           {user.role === 'Admin' && (
             <>
@@ -322,7 +372,10 @@ export default function App() {
         )}
       </main>
 
-      {/* Session Warning Modal */}
+
+        {/* Session Warning Modal */}
+        {user && socket && <ChatWidget user={user} socket={socket} token={token} />}
+
       {showSessionWarning && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[100] flex items-center justify-center p-4">
           <div className="bg-white dark:bg-zinc-900 rounded-2xl p-6 max-w-sm w-full shadow-2xl border border-zinc-200 dark:border-zinc-800">

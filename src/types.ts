@@ -4,6 +4,8 @@ export interface User {
   id: number;
   username: string;
   role: Role;
+  assignedCount?: number;
+  pendingCount?: number;
 }
 
 // Changing LeadStatus to string to allow dynamic stages
@@ -28,6 +30,9 @@ export interface Lead {
   address?: string;
   assignedUserId?: number;
   assignedUserName?: string;
+  priority?: string;
+  email?: string;
+  tags?: string[];
   requiredProduct?: string;
   quantity?: string;
   price?: string;
@@ -37,6 +42,9 @@ export interface Lead {
   installationSchedule?: string;
   actualInstallDate?: string;
   status: LeadStatus;
+  pendingTechId?: number;
+  techAssignmentStatus?: 'Pending' | 'Accepted' | 'Declined';
+  techAssignedAt?: string;
   createdAt: string;
 }
 

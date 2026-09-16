@@ -1,11 +1,8 @@
 import fs from 'fs';
-let schema = fs.readFileSync('src/db/schema.ts', 'utf-8');
 
-// Add resetToken and resetTokenExpiry to users table
-schema = schema.replace(
-  "passwordHash: text('password_hash'),",
-  "passwordHash: text('password_hash'),\n  resetToken: text('reset_token'),\n  resetTokenExpiry: timestamp('reset_token_expiry'),"
+let code = fs.readFileSync('src/db/schema.ts', 'utf-8');
+code = code.replace(
+  "declinedTechIds: text('declined_tech_ids'), // JSON array of IDs",
+  "declinedTechIds: text('declined_tech_ids'), // JSON array of IDs\n  techAssignedAt: timestamp('tech_assigned_at'), // For SLA tracking"
 );
-
-fs.writeFileSync('src/db/schema.ts', schema);
-console.log('Updated schema.ts');
+fs.writeFileSync('src/db/schema.ts', code);

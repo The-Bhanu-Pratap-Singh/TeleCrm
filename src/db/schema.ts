@@ -10,6 +10,8 @@ export const users = pgTable('users', {
   resetTokenExpiry: timestamp('reset_token_expiry'),
   role: text('role').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+  isArchived: integer('is_archived').default(0),
 });
 
 export const leads = pgTable('leads', {
@@ -27,7 +29,19 @@ export const leads = pgTable('leads', {
   installationSchedule: text('installation_schedule'),
   actualInstallDate: text('actual_install_date'),
   status: text('status'),
+  priority: text('priority').default('Medium'),
+  email: text('email'),
+  tags: text('tags'),
+  
+  // Tech Assignment Workflow
+  pendingTechId: integer('pending_tech_id').references(() => users.id, { onDelete: 'set null' }),
+  techAssignmentStatus: text('tech_assignment_status'), // 'Pending', 'Accepted', 'Declined'
+  declinedTechIds: text('declined_tech_ids'), // JSON array of IDs
+  techAssignedAt: timestamp('tech_assigned_at'), // For SLA tracking
+
   createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+  isArchived: integer('is_archived').default(0),
 });
 
 export const activityLogs = pgTable('activity_logs', {
@@ -37,6 +51,8 @@ export const activityLogs = pgTable('activity_logs', {
   leadId: integer('lead_id').references(() => leads.id, { onDelete: 'cascade' }),
   details: text('details'),
   createdAt: timestamp('created_at').defaultNow(),
+  updatedAt: timestamp('updated_at').defaultNow(),
+  isArchived: integer('is_archived').default(0),
 });
 
 export const attendance = pgTable('attendance', {
@@ -77,6 +93,37 @@ export const whatsappMessagesRelations = relations(whatsappMessages, ({ one }) =
   lead: one(leads, {
     fields: [whatsappMessages.leadId],
     references: [leads.id],
+  }),
+}));
+
+
+export const chatMessages = pgTable('chat_messages', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  message: text('message').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const notifications = pgTable('notifications', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  title: text('title').notNull(),
+  message: text('message').notNull(),
+  read: integer('read').default(0).notNull(), // 0 = false, 1 = true
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+});
+
+export const chatMessagesRelations = relations(chatMessages, ({ one }) => ({
+  user: one(users, {
+    fields: [chatMessages.userId],
+    references: [users.id],
+  }),
+}));
+
+export const notificationsRelations = relations(notifications, ({ one }) => ({
+  user: one(users, {
+    fields: [notifications.userId],
+    references: [users.id],
   }),
 }));
 

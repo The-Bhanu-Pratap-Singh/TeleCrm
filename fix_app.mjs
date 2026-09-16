@@ -1,36 +1,17 @@
 import fs from 'fs';
+
 let code = fs.readFileSync('src/App.tsx', 'utf-8');
 
-const regex = /useEffect\(\(\) => \{\s*if \(token\) \{\s*\/\/ In a real app[\s\S]*?setUser\(JSON\.parse\(storedUser\)\);\s*\}\s*\}\s*setLoading\(false\);\s*\}, \[token\]\);/;
+// Update currentView type for real if the previous regex failed
+code = code.replace(
+  "const [currentView, setCurrentView] = useState<'dashboard' | 'leads' | 'users' | 'activity'>('dashboard');",
+  "const [currentView, setCurrentView] = useState<'dashboard' | 'leads' | 'users' | 'activity' | 'calendar'>('dashboard');"
+);
 
-const replacement = `useEffect(() => {
-    const verifyToken = async () => {
-      if (token) {
-        try {
-          const res = await fetch('/api/me', {
-            headers: { Authorization: \`Bearer \${token}\` }
-          });
-          if (res.ok) {
-            const userData = await res.json();
-            setUser(userData);
-            localStorage.setItem('telecrm_user', JSON.stringify(userData));
-          } else {
-            handleLogout();
-          }
-        } catch (err) {
-          console.error(err);
-          // If network error, try to use local storage as fallback
-          const storedUser = localStorage.getItem('telecrm_user');
-          if (storedUser) {
-            setUser(JSON.parse(storedUser));
-          }
-        }
-      }
-      setLoading(false);
-    };
-    verifyToken();
-  }, [token]);`;
+// Look for handleNavigate
+code = code.replace(
+  "const handleNavigate = (view: 'dashboard' | 'leads' | 'users' | 'activity') => {",
+  "const handleNavigate = (view: 'dashboard' | 'leads' | 'users' | 'activity' | 'calendar') => {"
+);
 
-code = code.replace(regex, replacement);
 fs.writeFileSync('src/App.tsx', code);
-console.log("Patched App.tsx");

@@ -1,3 +1,21 @@
 @import "tailwindcss";
 
 @custom-variant dark (&:where(.dark, .dark *));
+
+@media print {
+  aside, header, .no-print { 
+    display: none !important; 
+  }
+  main, div { 
+    overflow: visible !important; 
+  }
+  body, html { 
+    height: auto !important; 
+    overflow: visible !important;
+    background-color: white !important;
+    color: black !important;
+  }
+  .print-break-inside-avoid {
+    break-inside: avoid;
+  }
+}
