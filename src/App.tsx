@@ -300,6 +300,7 @@ export default function App() {
             {currentView === 'leads' && <LeadsList user={user} token={token} />}
             {currentView === 'users' && user.role === 'Admin' && <AdminPanel token={token} />}
             {currentView === 'activity' && user.role === 'Admin' && <ActivityLogViewer token={token} />}
+            {currentView === 'calendar' && <CalendarAppView user={user} token={token} />}
           </div>
         </div>
 

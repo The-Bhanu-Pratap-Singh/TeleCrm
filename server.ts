@@ -11,7 +11,7 @@ import { Server } from 'socket.io';
 // Drizzle ORM Imports
 import { db } from './src/db/index.ts';
 import * as schema from './src/db/schema.ts';
-import { eq, inArray, and, or, desc, asc, sql, getTableColumns } from 'drizzle-orm';
+import { eq, inArray, and, or, desc, asc, sql, getTableColumns, lt } from 'drizzle-orm';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'super_secret_jwt_key_telecrm';
 
