@@ -51,6 +51,7 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
   // Attendance & Live Session State
   const [now, setNow] = useState(Date.now());
   const [punchLoading, setPunchLoading] = useState(false);
+  const [togglingUserId, setTogglingUserId] = useState<number | null>(null);
   const [attendanceSummary, setAttendanceSummary] = useState<AttendanceSummary | null>(null);
   const [teamAttendance, setTeamAttendance] = useState<TeamMemberAttendance[]>([]);
   const [activityFilter, setActivityFilter] = useState<'today' | '7days' | '30days'>('7days');
@@ -95,7 +96,11 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
       setPunchLoading(true);
       const res = await fetch(`/api/attendance/${action}`, {
         method: 'POST',
-        headers: { 'Authorization': `Bearer ${token}` }
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}` 
+        },
+        body: JSON.stringify({ forceRepunch: true })
       });
       if (res.ok) {
         await fetchAttendanceSummary();
@@ -105,6 +110,30 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
       console.error(e);
     } finally {
       setPunchLoading(false);
+    }
+  };
+
+  const handleAdminToggleUser = async (targetUserId: number) => {
+    try {
+      setTogglingUserId(targetUserId);
+      const res = await fetch('/api/attendance/admin-toggle-user', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ userId: targetUserId })
+      });
+      if (res.ok) {
+        await fetchTeamAttendance();
+        if (targetUserId === user.id) {
+          await fetchAttendanceSummary();
+        }
+      }
+    } catch (e) {
+      console.error('Failed to toggle attendance', e);
+    } finally {
+      setTogglingUserId(null);
     }
   };
 
@@ -519,6 +548,7 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
                   <th className="py-2.5 px-3">Active Hours</th>
                   <th className="py-2.5 px-3">Tasks Completed</th>
                   <th className="py-2.5 px-3">Today's Activity</th>
+                  <th className="py-2.5 px-3 text-right">Attendance Control</th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-zinc-100 dark:divide-zinc-800/80">
@@ -567,6 +597,22 @@ export default function Dashboard({ user, token, onNavigate }: DashboardProps) {
                         <span className="px-2 py-0.5 rounded text-xs font-semibold bg-indigo-50 dark:bg-indigo-950/50 text-indigo-700 dark:text-indigo-300">
                           {member.activityCount} actions
                         </span>
+                      </td>
+                      <td className="py-3 px-3 text-right">
+                        <button
+                          onClick={() => handleAdminToggleUser(member.user.id)}
+                          disabled={togglingUserId === member.user.id}
+                          className={`px-2.5 py-1 text-xs font-medium rounded-lg transition-colors shadow-xs ${
+                            isActive
+                              ? 'bg-amber-100 hover:bg-amber-200 text-amber-800 dark:bg-amber-950/80 dark:hover:bg-amber-900 dark:text-amber-300 border border-amber-300 dark:border-amber-800'
+                              : isOut
+                              ? 'bg-emerald-100 hover:bg-emerald-200 text-emerald-800 dark:bg-emerald-950/80 dark:hover:bg-emerald-900 dark:text-emerald-300 border border-emerald-300 dark:border-emerald-800'
+                              : 'bg-zinc-100 hover:bg-zinc-200 text-zinc-700 dark:bg-zinc-800 dark:hover:bg-zinc-700 dark:text-zinc-300 border border-zinc-300 dark:border-zinc-700'
+                          }`}
+                          title={isActive ? 'Clock out staff member' : isOut ? 'Re-punch in staff member' : 'Clock in staff member'}
+                        >
+                          {togglingUserId === member.user.id ? '...' : isOut ? 'Re-Punch In' : isActive ? 'Clock Out' : 'Clock In'}
+                        </button>
                       </td>
                     </tr>
                   );

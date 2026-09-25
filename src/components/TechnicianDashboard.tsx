@@ -136,13 +136,22 @@ export default function TechnicianDashboard({ user, token }: TechProps) {
                   <p className="text-[11px] text-zinc-400 mt-0.5">Out at {new Date(attendance.punchOut).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</p>
                 )}
               </div>
-              {!attendance.punchOut && (
+              {!attendance.punchOut ? (
                 <button
                   onClick={() => handlePunch('punch-out')}
                   disabled={punchLoading}
                   className="flex items-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-600 text-white text-xs font-semibold rounded-lg transition-colors shadow-xs"
                 >
                   <LogOut className="w-3.5 h-3.5" /> Punch Out
+                </button>
+              ) : (
+                <button
+                  onClick={() => handlePunch('punch-in')}
+                  disabled={punchLoading}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-semibold rounded-lg transition-colors shadow-xs"
+                  title="Re-punch in to resume shift"
+                >
+                  <LogIn className="w-3.5 h-3.5" /> Re-Punch In
                 </button>
               )}
             </div>

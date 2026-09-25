@@ -1450,7 +1450,7 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
 
   // ----- Attendance & Daily Activity Tracking API -----
   
-  // Punch In (called automatically on login or via dashboard action)
+  // Punch In / Re-Punch In (called automatically on login or via dashboard action)
   app.post('/api/attendance/punch-in', authenticateToken, async (req: any, res) => {
     const userId = req.user.id;
     const date = new Date().toISOString().split('T')[0];
@@ -1459,8 +1459,23 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
         .from(schema.attendance)
         .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)))
         .then(res => res[0] || null);
+
       if (existing) {
-        return res.json({ success: true, message: 'Already punched in today', data: existing });
+        // If the user was previously punched out, re-punch in (resume shift)
+        if (existing.punchOut || req.body?.forceRepunch) {
+          await db.update(schema.attendance)
+            .set({ punchOut: null })
+            .where(eq(schema.attendance.id, existing.id));
+
+          const updatedRecord = await db.select()
+            .from(schema.attendance)
+            .where(eq(schema.attendance.id, existing.id))
+            .then(res => res[0] || null);
+
+          await logAudit(userId, 'Punch In', 'Re-punched in to resume active work shift');
+          return res.json({ success: true, message: 'Re-punched in successfully', data: updatedRecord });
+        }
+        return res.json({ success: true, message: 'Already punched in today and active', data: existing });
       }
       
       const punchInTime = new Date().toISOString();
@@ -1498,6 +1513,54 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: 'Failed to punch out' });
+    }
+  });
+
+  // Admin Override: Toggle Punch In / Re-Punch / Punch Out for any team member
+  app.post('/api/attendance/admin-toggle-user', authenticateToken, requireRole(['Admin']), async (req: any, res: Response) => {
+    const targetUserId = Number(req.body.userId);
+    const date = req.body.date || new Date().toISOString().split('T')[0];
+    if (!targetUserId) return res.status(400).json({ error: 'Missing userId' });
+
+    try {
+      const existing = await db.select()
+        .from(schema.attendance)
+        .where(and(eq(schema.attendance.userId, targetUserId), eq(schema.attendance.date, date)))
+        .then(res => res[0] || null);
+
+      if (!existing) {
+        // Punch in user
+        const punchInTime = new Date().toISOString();
+        const [resObj] = await db.insert(schema.attendance).values({ userId: targetUserId, date, punchIn: punchInTime });
+        const newRecord = await db.select()
+          .from(schema.attendance)
+          .where(eq(schema.attendance.id, (resObj as any).insertId))
+          .then((r: any) => r[0] || null);
+        await logAudit(req.user.id, 'Admin Attendance Override', `Admin clocked in user ID ${targetUserId}`);
+        return res.json({ success: true, action: 'punched-in', data: newRecord });
+      }
+
+      if (existing.punchOut) {
+        // Re-punch in
+        await db.update(schema.attendance)
+          .set({ punchOut: null })
+          .where(eq(schema.attendance.id, existing.id));
+        const updated = await db.select().from(schema.attendance).where(eq(schema.attendance.id, existing.id)).then(r => r[0]);
+        await logAudit(req.user.id, 'Admin Attendance Override', `Admin re-punched in user ID ${targetUserId}`);
+        return res.json({ success: true, action: 're-punched-in', data: updated });
+      } else {
+        // Punch out
+        const punchOutTime = new Date().toISOString();
+        await db.update(schema.attendance)
+          .set({ punchOut: punchOutTime })
+          .where(eq(schema.attendance.id, existing.id));
+        const updated = await db.select().from(schema.attendance).where(eq(schema.attendance.id, existing.id)).then(r => r[0]);
+        await logAudit(req.user.id, 'Admin Attendance Override', `Admin clocked out user ID ${targetUserId}`);
+        return res.json({ success: true, action: 'punched-out', data: updated });
+      }
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: 'Failed to toggle attendance' });
     }
   });
 
