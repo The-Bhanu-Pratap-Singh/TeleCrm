@@ -204,7 +204,7 @@ export default function App() {
           </div>
 
           <div className="flex items-center gap-2">
-            {user && socket && <NotificationBell user={user} socket={socket} />}
+            {user && socket && <NotificationBell user={user} socket={socket} token={token || ''} />}
             <button
               onClick={() => setIsMobileMenuOpen(false)}
               className="p-2 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 md:hidden"

@@ -1,5 +1,6 @@
 import { GoogleGenAI } from '@google/genai';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import express, { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import jwt from 'jsonwebtoken';
@@ -23,7 +24,7 @@ async function startServer() {
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
       
-      const res = await db.update(schema.leads)
+      await db.update(schema.leads)
         .set({ isArchived: 1 })
         .where(
           and(
@@ -31,12 +32,7 @@ async function startServer() {
             lt(schema.leads.updatedAt, thirtyDaysAgo),
             eq(schema.leads.isArchived, 0)
           )
-        )
-        .returning({ id: schema.leads.id });
-        
-      if (res.length > 0) {
-        console.log("Archived " + res.length + " old leads.");
-      }
+        );
     } catch (e) {
       console.error('Cleanup policy error:', e);
     }
@@ -47,10 +43,21 @@ async function startServer() {
   setInterval(runCleanup, 60 * 60 * 1000);
 
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json());
   app.use(cookieParser());
+
+  // Security Headers Middleware
+  app.use((req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+    next();
+  });
+
+  // Login Brute Force Protection Tracker
+  const loginAttempts = new Map<string, { count: number; lockedUntil: number }>();
 
   // ----- Middleware: Auth -----
   const authenticateToken = (req: any, res: Response, next: NextFunction) => {
@@ -82,7 +89,8 @@ async function startServer() {
 
   const pushNotification = async (userId: number, title: string, message: string, io: any) => {
     try {
-      const [notif] = await db.insert(schema.notifications).values({ userId, title, message }).returning();
+      const [resObj] = await db.insert(schema.notifications).values({ userId, title, message });
+      const notif = await db.select().from(schema.notifications).where(eq(schema.notifications.id, (resObj as any).insertId)).then((r: any) => r[0]);
       if (io) {
         io.to(`user_${userId}`).emit('new_notification', notif);
       }
@@ -91,7 +99,7 @@ async function startServer() {
     }
   };
 
-  const logAudit = async (userId, action, details, leadId = null) => {
+  const logAudit = async (userId: number | null, action: string, details: string, leadId: number | null = null) => {
     try {
       await db.insert(schema.activityLogs).values({
         userId,
@@ -103,6 +111,163 @@ async function startServer() {
       console.error('Audit log failed', e);
     }
   };
+
+  // Automated Smart Matching Engine for Technicians
+  const findBestTechnician = async (leadAddress: string = '', excludedIds: number[] = []) => {
+    try {
+      const techs = await db.select().from(schema.users).where(eq(schema.users.role, 'Technician'));
+      if (techs.length === 0) return null;
+
+      const todayStr = new Date().toISOString().split('T')[0];
+      const todayAttendance = await db.select().from(schema.attendance).where(eq(schema.attendance.date, todayStr));
+      
+      const workloads = await db.select({
+        assignedUserId: schema.leads.assignedUserId,
+        pendingTechId: schema.leads.pendingTechId,
+        techAssignmentStatus: schema.leads.techAssignmentStatus,
+      }).from(schema.leads).where(eq(schema.leads.isArchived, 0));
+
+      let bestTech: any = null;
+      let minScore = Infinity;
+
+      for (const tech of techs) {
+        if (excludedIds.includes(tech.id)) continue;
+
+        // Base workload: active jobs + pending jobs
+        const assignedCount = workloads.filter(w => w.assignedUserId === tech.id && ['Accepted', null, undefined].includes(w.techAssignmentStatus)).length;
+        const pendingCount = workloads.filter(w => w.pendingTechId === tech.id && w.techAssignmentStatus === 'Pending').length;
+        let score = (assignedCount * 2) + pendingCount;
+
+        // Attendance & active hours status
+        const att = todayAttendance.find(a => a.userId === tech.id);
+        if (att && att.punchIn && !att.punchOut) {
+          score -= 5; // Actively clocked in and working
+        } else if (att && att.punchOut) {
+          score += 15; // Clocked out for the day
+        } else {
+          score += 5; // Not clocked in yet
+        }
+
+        // Location / Pincode proximity matching
+        const techName = tech.username.toLowerCase();
+        const addr = (leadAddress || '').toLowerCase();
+        if (addr && addr.includes(techName)) {
+          score -= 10;
+        }
+
+        if (score < minScore) {
+          minScore = score;
+          bestTech = tech;
+        }
+      }
+
+      return bestTech;
+    } catch (err) {
+      console.error('findBestTechnician error:', err);
+      return null;
+    }
+  };
+
+  // Background 30-Minute SLA Timeout Automation Worker
+  const runSlaCheck = async () => {
+    try {
+      const pendingLeads = await db.select()
+        .from(schema.leads)
+        .where(
+          and(
+            eq(schema.leads.techAssignmentStatus, 'Pending'),
+            eq(schema.leads.isArchived, 0)
+          )
+        );
+
+      const now = Date.now();
+      const SLA_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+
+      for (const lead of pendingLeads) {
+        if (!lead.techAssignedAt || !lead.pendingTechId) continue;
+        const assignedTime = new Date(lead.techAssignedAt).getTime();
+        
+        if (now - assignedTime >= SLA_TIMEOUT_MS) {
+          const expiredTechId = lead.pendingTechId;
+          const declinedArr: number[] = lead.declinedTechIds ? JSON.parse(lead.declinedTechIds) : [];
+          if (!declinedArr.includes(expiredTechId)) {
+            declinedArr.push(expiredTechId);
+          }
+
+          // Immutable audit trail for SLA timeout revocation
+          await logAudit(
+            expiredTechId,
+            'SLA Timeout Expired',
+            `Technician response timed out after 30 minutes for lead "${lead.clientName}". Assignment automatically revoked.`,
+            lead.id
+          );
+
+          // Route task to next available technician
+          const nextTech = await findBestTechnician(lead.address || '', declinedArr);
+
+          if (nextTech) {
+            await db.update(schema.leads).set({
+              pendingTechId: nextTech.id,
+              techAssignmentStatus: 'Pending',
+              techAssignedAt: new Date(),
+              declinedTechIds: JSON.stringify(declinedArr),
+              updatedAt: new Date()
+            }).where(eq(schema.leads.id, lead.id));
+
+            await pushNotification(
+              nextTech.id,
+              'Escalated SLA Task Assigned',
+              `Lead "${lead.clientName}" was routed to you after previous technician timed out.`,
+              app.get('io')
+            );
+
+            await logAudit(
+              nextTech.id,
+              'Auto-Escalated Assignment',
+              `Auto-routed task to next available technician: ${nextTech.username} due to SLA timeout.`,
+              lead.id
+            );
+          } else {
+            // All technicians exhausted
+            await db.update(schema.leads).set({
+              pendingTechId: null,
+              techAssignmentStatus: 'Escalated - Unassigned',
+              declinedTechIds: JSON.stringify(declinedArr),
+              updatedAt: new Date()
+            }).where(eq(schema.leads.id, lead.id));
+
+            const admins = await db.select().from(schema.users).where(eq(schema.users.role, 'Admin'));
+            for (const admin of admins) {
+              await pushNotification(
+                admin.id,
+                'SLA Alert: All Technicians Timed Out',
+                `Lead "${lead.clientName}" could not be auto-assigned; all technicians declined or timed out.`,
+                app.get('io')
+              );
+            }
+
+            await logAudit(
+              null,
+              'SLA Escalation Alert',
+              `All available technicians timed out or declined lead "${lead.clientName}". Escalated to Admin review.`,
+              lead.id
+            );
+          }
+
+          const ioInstance = app.get('io');
+          if (ioInstance) {
+            ioInstance.emit('lead_updated', { id: lead.id });
+          }
+        }
+      }
+    } catch (e) {
+      console.error('SLA Check Error:', e);
+    }
+  };
+
+  // Run on start and every 30 seconds
+  runSlaCheck();
+  setInterval(runSlaCheck, 30 * 1000);
 
   const requireRole = (roles: string[]) => {
     return (req: any, res: Response, next: NextFunction) => {
@@ -118,16 +283,37 @@ async function startServer() {
   // Login
   app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
+    const ip = req.ip || req.socket.remoteAddress || 'unknown';
+    const key = `${ip}_${username}`;
+    const now = Date.now();
+    const attempt = loginAttempts.get(key);
+
+    if (attempt && attempt.lockedUntil > now) {
+      const waitSec = Math.ceil((attempt.lockedUntil - now) / 1000);
+      return res.status(429).json({ error: `Too many failed login attempts. Please try again in ${waitSec} seconds.` });
+    }
+
     try {
       const user = await db.select().from(schema.users).where(eq(schema.users.username, username)).then(res => res[0] || null);
       if (!user) {
+        const cur = loginAttempts.get(key) || { count: 0, lockedUntil: 0 };
+        cur.count += 1;
+        if (cur.count >= 5) cur.lockedUntil = now + 60 * 1000;
+        loginAttempts.set(key, cur);
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
       const validPassword = await bcrypt.compare(password, user.passwordHash);
       if (!validPassword) {
+        const cur = loginAttempts.get(key) || { count: 0, lockedUntil: 0 };
+        cur.count += 1;
+        if (cur.count >= 5) cur.lockedUntil = now + 60 * 1000;
+        loginAttempts.set(key, cur);
         return res.status(401).json({ error: 'Invalid credentials' });
       }
+
+      // Successful login clears attempt counter
+      loginAttempts.delete(key);
 
       const token = jwt.sign(
         { id: user.id, username: user.username, role: user.role },
@@ -142,6 +328,22 @@ async function startServer() {
         sameSite: 'strict',
         maxAge: 24 * 60 * 60 * 1000 // 24 hours
       });
+
+      // Auto-punch-in for today if not already punched in
+      const todayDate = new Date().toISOString().split('T')[0];
+      const existingAttendance = await db.select()
+        .from(schema.attendance)
+        .where(and(eq(schema.attendance.userId, user.id), eq(schema.attendance.date, todayDate)))
+        .then(r => r[0] || null);
+
+      if (!existingAttendance) {
+        await db.insert(schema.attendance).values({
+          userId: user.id,
+          date: todayDate,
+          punchIn: new Date().toISOString()
+        });
+        await logAudit(user.id, 'Punch In', 'Automatically recorded punch-in on login');
+      }
 
       await logAudit(user.id, 'Login', 'User logged in successfully');
       res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
@@ -159,7 +361,12 @@ async function startServer() {
       const user = await db.select().from(schema.users).where(eq(schema.users.username, username)).then(r => r[0]);
       if (!user) return res.status(404).json({ error: 'User not found' });
       
-      const resetToken = require('crypto').randomBytes(32).toString('hex');
+      // Protect default Administrator account from public password reset takeover
+      if (user.role === 'Admin') {
+        return res.status(403).json({ error: 'Administrator password cannot be reset via public recovery.' });
+      }
+
+      const resetToken = crypto.randomBytes(32).toString('hex');
       const resetTokenExpiry = new Date(Date.now() + 15 * 60 * 1000); // 15 mins
       
       await db.update(schema.users).set({ resetToken, resetTokenExpiry }).where(eq(schema.users.id, user.id));
@@ -181,6 +388,10 @@ async function startServer() {
       
       if (!user || user.resetToken !== resetToken || !user.resetTokenExpiry || new Date() > user.resetTokenExpiry) {
         return res.status(400).json({ error: 'Invalid or expired token' });
+      }
+
+      if (user.role === 'Admin') {
+        return res.status(403).json({ error: 'Administrator password cannot be reset via public recovery.' });
       }
       
       const passwordHash = await bcrypt.hash(newPassword, 10);
@@ -282,10 +493,11 @@ async function startServer() {
     const { username, password, role } = req.body;
     try {
       const passwordHash = await bcrypt.hash(password, 10);
-      const newUser = await db.insert(schema.users)
-        .values({ username, passwordHash, role })
-        .returning({ id: schema.users.id, username: schema.users.username, role: schema.users.role })
-        .then(res => res[0] || null); // .then(res => res[0] || null) for single returned row
+      const [resObj] = await db.insert(schema.users).values({ username, passwordHash, role });
+      const newUser = await db.select({ id: schema.users.id, username: schema.users.username, role: schema.users.role })
+        .from(schema.users)
+        .where(eq(schema.users.id, (resObj as any).insertId))
+        .then((r: any) => r[0] || null);
       res.json(newUser);
     } catch (error) {
       console.error(error);
@@ -336,27 +548,12 @@ async function startServer() {
       }
       
       const declinedArr = lead.declinedTechIds ? JSON.parse(lead.declinedTechIds) : [];
-      declinedArr.push(userId);
-      
-      // Auto-assign to next tech
-      const techs = await db.select().from(schema.users).where(eq(schema.users.role, 'Technician'));
-      let bestTech = null;
-      let minWorkload = Infinity;
-      
-      for (const tech of techs) {
-        if (declinedArr.includes(tech.id)) continue; 
-        
-        const workloadResult = await db.select({ count: sql`count(*)`.mapWith(Number) })
-          .from(schema.leads)
-          .where(eq(schema.leads.assignedUserId, tech.id));
-        const count = workloadResult[0].count;
-        
-        let score = count;
-        if (score < minWorkload) {
-          minWorkload = score;
-          bestTech = tech;
-        }
+      if (!declinedArr.includes(userId)) {
+        declinedArr.push(userId);
       }
+      
+      // Auto-assign to next tech using smart matching engine
+      const bestTech = await findBestTechnician(lead.address || '', declinedArr);
       
       let nextPendingId = null;
       let newStatus = 'Declined';
@@ -376,10 +573,16 @@ async function startServer() {
         pendingTechId: nextPendingId,
         techAssignmentStatus: newStatus,
         declinedTechIds: JSON.stringify(declinedArr),
-        techAssignedAt: bestTech ? new Date() : null
+        techAssignedAt: bestTech ? new Date() : null,
+        updatedAt: new Date()
       }).where(eq(schema.leads.id, Number(id)));
       
-      await logAudit(userId, 'Technician Assignment', `Declined lead ID ${id}`, Number(id));
+      await logAudit(userId, 'Technician Declined', `Technician declined lead "${lead.clientName}". Routed to next available technician.`, Number(id));
+
+      const ioInstance = app.get('io');
+      if (ioInstance) {
+        ioInstance.emit('lead_updated', { id: Number(id) });
+      }
       
       res.json({ success: true, reassigned: !!bestTech });
     } catch (e) {
@@ -489,13 +692,20 @@ async function startServer() {
       let updateData = { ...otherUpdates };
       if (status) updateData.status = status;
       if (assignedUserId !== undefined) {
+         if (req.user.role !== 'Admin') {
+           return res.status(403).json({ error: 'Only administrators can reassign leads.' });
+         }
          updateData.assignedUserId = assignedUserId;
          // Clear pending if manually reassigned
          updateData.pendingTechId = null;
          updateData.techAssignmentStatus = assignedUserId ? 'Accepted' : null;
       }
       
-      await db.update(schema.leads).set(updateData).where(inArray(schema.leads.id, leadIds));
+      const whereCondition = req.user.role === 'Admin'
+        ? inArray(schema.leads.id, leadIds)
+        : and(inArray(schema.leads.id, leadIds), eq(schema.leads.assignedUserId, req.user.id));
+
+      await db.update(schema.leads).set(updateData).where(whereCondition);
       
       await logAudit(req.user.id, 'Bulk Update', `Updated ${leadIds.length} leads`);
       
@@ -566,31 +776,51 @@ async function startServer() {
     } = req.body;
     
     try {
-      const finalAssignedUserId = assignedUserId || req.user.id;
-      const newLead = await db.insert(schema.leads)
+      // Exclusive Lead Ownership: Non-admin users cannot assign leads to other agents
+      const finalAssignedUserId = req.user.role === 'Admin' ? (assignedUserId || req.user.id) : req.user.id;
+      const initialStatus = status || 'New';
+
+      // Check if initial status triggers automated technician matching
+      const schedulingStages = ["Scheduled", "Installed", "Site Visit Scheduled", "Installation Scheduled"];
+      let pendingTechId: number | null = null;
+      let techAssignmentStatus: string | null = null;
+      let techAssignedAt: Date | null = null;
+
+      if (schedulingStages.includes(initialStatus)) {
+        const bestTech = await findBestTechnician(address || '', []);
+        if (bestTech) {
+          pendingTechId = bestTech.id;
+          techAssignmentStatus = 'Pending';
+          techAssignedAt = new Date();
+        }
+      }
+
+      const [resObj] = await db.insert(schema.leads)
         .values({
           clientName, contact, address, assignedUserId: finalAssignedUserId, requiredProduct,
           quantity, price, notes: JSON.stringify(notes || []), nextFollowUp, visitSchedule,
-          installationSchedule, actualInstallDate, status: status || 'New', priority: priority || 'Medium',
-          email, tags: Array.isArray(tags) ? JSON.stringify(tags) : JSON.stringify(tags || []), updatedAt: sql`CURRENT_TIMESTAMP`
-        })
-        .returning({ id: schema.leads.id })
-        .then(res => res[0] || null);
-      const leadId = newLead.id;
+          installationSchedule, actualInstallDate, status: initialStatus, priority: priority || 'Medium',
+          email, tags: Array.isArray(tags) ? JSON.stringify(tags) : JSON.stringify(tags || []),
+          pendingTechId, techAssignmentStatus, techAssignedAt,
+          updatedAt: sql`CURRENT_TIMESTAMP`
+        });
+      const leadId = (resObj as any).insertId;
 
       if (finalAssignedUserId && finalAssignedUserId !== req.user.id) {
         await pushNotification(finalAssignedUserId, 'New Lead Assigned', `You have been assigned a new lead: ${clientName}`, app.get('io'));
       }
 
-      // Log activity
-      await db.insert(schema.activityLogs)
-        .values({
-          userId: req.user.id,
-          action: 'Created Lead',
-          leadId: leadId,
-          details: `Lead ${clientName} created`
-        })
-        ;
+      if (pendingTechId) {
+        await pushNotification(pendingTechId, 'New Task Assigned', `You have been selected for a new task: ${clientName}`, app.get('io'));
+      }
+
+      // Log immutable audit activity
+      await logAudit(
+        req.user.id,
+        'Created Lead',
+        `Lead "${clientName}" created and assigned to user ID ${finalAssignedUserId}${pendingTechId ? ` with technician ID ${pendingTechId} pending acceptance` : ''}`,
+        leadId
+      );
 
       res.json({ id: leadId });
     } catch (error) {
@@ -634,9 +864,13 @@ async function startServer() {
     try {
       await db.transaction(async (tx) => {
         for (const id of leadIds) {
+          const condition = req.user.role === 'Admin'
+            ? eq(schema.leads.id, id)
+            : and(eq(schema.leads.id, id), eq(schema.leads.assignedUserId, req.user.id));
+
           await tx.update(schema.leads)
             .set({ status: status })
-            .where(eq(schema.leads.id, id))
+            .where(condition)
             ;
           
           await tx.insert(schema.activityLogs)
@@ -691,12 +925,22 @@ async function startServer() {
         return res.status(400).json({ error: 'Note cannot be empty' });
       }
       
-      const lead = await db.select({ clientName: schema.leads.clientName, notes: schema.leads.notes })
+      const lead = await db.select({ 
+        clientName: schema.leads.clientName, 
+        notes: schema.leads.notes,
+        assignedUserId: schema.leads.assignedUserId,
+        pendingTechId: schema.leads.pendingTechId
+      })
         .from(schema.leads)
         .where(eq(schema.leads.id, Number(id)))
         .then(res => res[0] || null);
 
       if (!lead) return res.status(404).json({ error: 'Lead not found' });
+
+      // Exclusive Lead Ownership check
+      if (req.user.role !== 'Admin' && lead.assignedUserId !== req.user.id && lead.pendingTechId !== req.user.id) {
+        return res.status(403).json({ error: 'Exclusive lead ownership violation: You do not have permission to add notes to this lead.' });
+      }
       
       await db.transaction(async (tx) => {
         // We can also optionally append to the lead's JSON notes
@@ -767,7 +1011,7 @@ async function startServer() {
              notesArr.push({ text: lead.notes, timestamp: new Date().toISOString(), author: req.user.username || 'System' });
           }
 
-          const newLead = await tx.insert(schema.leads)
+          const [resObj] = await tx.insert(schema.leads)
             .values({
               clientName, 
               contact, 
@@ -777,16 +1021,15 @@ async function startServer() {
               status, 
               notes: JSON.stringify(notesArr),
               assignedUserId: req.user.id
-            })
-            .returning({ id: schema.leads.id })
-            .then(res => res[0] || null);
+            });
           
-          if (newLead) {
+          const newLeadId = (resObj as any)?.insertId;
+          if (newLeadId) {
             await tx.insert(schema.activityLogs)
               .values({
                 userId: req.user.id,
                 action: 'Imported Lead',
-                leadId: newLead.id,
+                leadId: newLeadId,
                 details: `Imported lead via CSV bulk upload`
               });
             importedCount++;
@@ -801,119 +1044,207 @@ async function startServer() {
     }
   });
 
-  // Update Lead
+  // Update Lead (ACID compliant transaction with Exclusive Ownership and Immutable Audit Logging)
   app.put('/api/leads/:id', authenticateToken, async (req: any, res) => {
     const { id } = req.params;
     const {
       clientName, contact, address, assignedUserId, requiredProduct,
       quantity, price, notes, nextFollowUp, visitSchedule,
-      installationSchedule, actualInstallDate, status, priority, email, tags
+      installationSchedule, actualInstallDate, status, priority, email, tags,
+      reassignmentReason
     } = req.body;
     
     try {
-      // Access Control
-      const existingLead = await db.select({
-          assignedUserId: schema.leads.assignedUserId,
-          clientName: schema.leads.clientName,
-          status: schema.leads.status,
-          techAssignmentStatus: schema.leads.techAssignmentStatus,
-          declinedTechIds: schema.leads.declinedTechIds,
-          address: schema.leads.address
-        }).from(schema.leads).where(eq(schema.leads.id, Number(id))).then(res => res[0] || null);
+      await db.transaction(async (tx) => {
+        // Concurrency Lock: Read inside ACID transaction
+        const existingLead = await tx.select().from(schema.leads).where(eq(schema.leads.id, Number(id))).then(res => res[0] || null);
 
-      if (!existingLead) {
-        return res.status(404).json({ error: 'Lead not found' });
-      }
-      if (req.user.role !== 'Admin' && existingLead.assignedUserId !== req.user.id) {
-        return res.status(403).json({ error: 'You do not have permission to modify this lead. It is assigned to someone else.' });
-      }
+        if (!existingLead) {
+          return res.status(404).json({ error: 'Lead not found' });
+        }
 
-      // Check if status changed to a scheduling stage
-      const schedulingStages = ["Scheduled", "Installed", "Site Visit Scheduled", "Installation Scheduled"];
-      let newPendingTechId = undefined;
-      let newTechAssignmentStatus = undefined;
-      let newTechAssignedAt = undefined;
-      
-      if (status && status !== existingLead.status && schedulingStages.includes(status) && (!existingLead.techAssignmentStatus || existingLead.techAssignmentStatus === 'Declined')) {
-        // Auto-assign algorithm
-        const techs = await db.select().from(schema.users).where(eq(schema.users.role, 'Technician'));
-        
-        if (techs.length > 0) {
-          let bestTech = null;
-          let minWorkload = Infinity;
-          
+        // Exclusive Lead Ownership: Once a lead is assigned, no other non-admin user can access, edit, or re-assign
+        if (req.user.role !== 'Admin' && existingLead.assignedUserId !== req.user.id && existingLead.pendingTechId !== req.user.id) {
+          return res.status(403).json({ error: 'Exclusive lead ownership violation: This lead is locked to another user.' });
+        }
+
+        // Full override, visibility, and re-assignment privileges reserved EXCLUSIVELY for Admin role
+        if (assignedUserId !== undefined && Number(assignedUserId) !== Number(existingLead.assignedUserId) && req.user.role !== 'Admin') {
+          return res.status(403).json({ error: 'Exclusive privilege violation: Only administrators can re-assign leads.' });
+        }
+
+        const schedulingStages = ["Scheduled", "Installed", "Site Visit Scheduled", "Installation Scheduled"];
+        let newPendingTechId = existingLead.pendingTechId;
+        let newTechAssignmentStatus = existingLead.techAssignmentStatus;
+        let newTechAssignedAt = existingLead.techAssignedAt;
+
+        // Auto-assign matching engine if status transitioned to a scheduling stage
+        if (status && status !== existingLead.status && schedulingStages.includes(status) && (!existingLead.techAssignmentStatus || existingLead.techAssignmentStatus === 'Declined')) {
           const declinedArr = existingLead.declinedTechIds ? JSON.parse(existingLead.declinedTechIds) : [];
-          
-          for (const tech of techs) {
-            if (declinedArr.includes(tech.id)) continue; 
-            
-            const workloadResult = await db.select({ count: sql`count(*)`.mapWith(Number) })
-              .from(schema.leads)
-              .where(eq(schema.leads.assignedUserId, tech.id));
-              
-            const count = workloadResult[0].count;
-            
-            let score = count;
-            const techName = tech.username.toLowerCase();
-            const addr = (address || existingLead.address || '').toLowerCase();
-            if (addr && addr.includes(techName)) {
-               score -= 10; 
-            }
-            
-            if (score < minWorkload) {
-              minWorkload = score;
-              bestTech = tech;
-            }
-          }
+          const bestTech = await findBestTechnician(address || existingLead.address || '', declinedArr);
           
           if (bestTech) {
             newPendingTechId = bestTech.id;
             newTechAssignmentStatus = 'Pending';
             newTechAssignedAt = new Date();
             
-            await db.insert(schema.notifications).values({
+            await tx.insert(schema.notifications).values({
               userId: bestTech.id,
               title: 'New Lead Assignment',
               message: `You have been selected for a new task: ${clientName || existingLead.clientName}`
             });
+
+            await tx.insert(schema.activityLogs).values({
+              userId: req.user.id,
+              action: 'Technician Assigned',
+              details: `Auto-matched technician ${bestTech.username} for stage "${status}" (Pending Acceptance)`,
+              leadId: Number(id)
+            });
           }
         }
+
+        const updateData: Record<string, any> = {
+          updatedAt: new Date()
+        };
+
+        if (clientName !== undefined) updateData.clientName = clientName;
+        if (contact !== undefined) updateData.contact = contact;
+        if (address !== undefined) updateData.address = address;
+        if (requiredProduct !== undefined) updateData.requiredProduct = requiredProduct;
+        if (quantity !== undefined) updateData.quantity = quantity;
+        if (price !== undefined) updateData.price = price;
+        if (notes !== undefined) updateData.notes = JSON.stringify(notes || []);
+        if (nextFollowUp !== undefined) updateData.nextFollowUp = nextFollowUp;
+        if (visitSchedule !== undefined) updateData.visitSchedule = visitSchedule;
+        if (installationSchedule !== undefined) updateData.installationSchedule = installationSchedule;
+        if (actualInstallDate !== undefined) updateData.actualInstallDate = actualInstallDate;
+        if (status !== undefined) updateData.status = status;
+        if (priority !== undefined) updateData.priority = priority;
+        if (email !== undefined) updateData.email = email;
+        if (tags !== undefined) updateData.tags = Array.isArray(tags) ? JSON.stringify(tags) : JSON.stringify(tags || []);
+
+        if (req.user.role === 'Admin' && assignedUserId !== undefined) {
+          updateData.assignedUserId = assignedUserId;
+          if (Number(assignedUserId) !== Number(existingLead.assignedUserId)) {
+            // Clear pending tech if manually reassigned
+            updateData.pendingTechId = null;
+            updateData.techAssignmentStatus = assignedUserId ? 'Accepted' : null;
+          }
+        }
+
+        if (newPendingTechId !== existingLead.pendingTechId) {
+          updateData.pendingTechId = newPendingTechId;
+          updateData.techAssignmentStatus = newTechAssignmentStatus;
+          updateData.techAssignedAt = newTechAssignedAt;
+        }
+
+        await tx.update(schema.leads).set(updateData).where(eq(schema.leads.id, Number(id)));
+
+        // --- Immutable Chronological Audit Trail Logging ---
+        
+        // 1. Stage changes
+        if (status && status !== existingLead.status) {
+          await tx.insert(schema.activityLogs).values({
+            userId: req.user.id,
+            action: 'Stage Changed',
+            details: `Pipeline stage changed from "${existingLead.status}" to "${status}"`,
+            leadId: Number(id)
+          });
+        }
+
+        // 2. Price negotiations
+        if (price !== undefined && price !== existingLead.price) {
+          await tx.insert(schema.activityLogs).values({
+            userId: req.user.id,
+            action: 'Price Negotiation',
+            details: `Negotiated price updated from "${existingLead.price || 'None'}" to "${price}"`,
+            leadId: Number(id)
+          });
+        }
+
+        // 3. Re-assignments (Handing off lead and why)
+        if (req.user.role === 'Admin' && assignedUserId !== undefined && Number(assignedUserId) !== Number(existingLead.assignedUserId)) {
+          const prevUser = existingLead.assignedUserId 
+            ? await tx.select({ username: schema.users.username }).from(schema.users).where(eq(schema.users.id, existingLead.assignedUserId)).then(r => r[0]?.username || 'Unknown')
+            : 'Unassigned';
+          const newUser = assignedUserId 
+            ? await tx.select({ username: schema.users.username }).from(schema.users).where(eq(schema.users.id, Number(assignedUserId))).then(r => r[0]?.username || 'Unknown')
+            : 'Unassigned';
+
+          await tx.insert(schema.activityLogs).values({
+            userId: req.user.id,
+            action: 'Lead Reassigned',
+            details: `Lead handed off from ${prevUser} to ${newUser}. Reason: ${reassignmentReason || 'Administrative reassignment'}`,
+            leadId: Number(id)
+          });
+
+          if (assignedUserId && assignedUserId !== req.user.id) {
+            await pushNotification(Number(assignedUserId), 'Lead Assigned', `Lead "${clientName || existingLead.clientName}" has been assigned to you.`, app.get('io'));
+          }
+        }
+
+        // 4. Follow-up scheduling
+        if (nextFollowUp && nextFollowUp !== existingLead.nextFollowUp) {
+          await tx.insert(schema.activityLogs).values({
+            userId: req.user.id,
+            action: 'Follow-up Scheduled',
+            details: `Next follow-up scheduled for ${nextFollowUp}`,
+            leadId: Number(id)
+          });
+        }
+
+        // 5. General modification fallback if no specific field triggered
+        if (!status && !price && assignedUserId === undefined && !nextFollowUp) {
+          await tx.insert(schema.activityLogs).values({
+            userId: req.user.id,
+            action: 'Updated Lead',
+            details: `Updated details for ${clientName || existingLead.clientName}`,
+            leadId: Number(id)
+          });
+        }
+      });
+
+      const ioInstance = app.get('io');
+      if (ioInstance) {
+        ioInstance.emit('lead_updated', { id: Number(id) });
       }
-
-      const updateData = {
-        clientName, contact, address, assignedUserId, requiredProduct,
-        quantity, price, notes: JSON.stringify(notes || []), nextFollowUp, visitSchedule,
-        installationSchedule, actualInstallDate, status, priority,
-        email, tags: Array.isArray(tags) ? JSON.stringify(tags) : JSON.stringify(tags || [])
-      };
-      
-      if (newPendingTechId !== undefined) {
-        updateData.pendingTechId = newPendingTechId;
-        updateData.techAssignmentStatus = newTechAssignmentStatus;
-        updateData.techAssignedAt = newTechAssignedAt;
-      }
-
-      await db.update(schema.leads).set(updateData).where(eq(schema.leads.id, Number(id)));
-
-      if (assignedUserId && assignedUserId !== existingLead.assignedUserId && assignedUserId !== req.user.id) {
-         await pushNotification(assignedUserId, 'Lead Assigned', `Lead ${clientName || existingLead.clientName} has been assigned to you.`, app.get('io'));
-      }
-
-
-      // Log activity
-      await db.insert(schema.activityLogs)
-        .values({
-          userId: req.user.id,
-          action: 'Updated Lead',
-          leadId: Number(id),
-          details: `Updated details for ${clientName}`
-        })
-        ;
 
       res.json({ success: true });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: 'Failed to update lead' });
+    }
+  });
+
+  // Immutable Audit Trail for Lead
+  app.get('/api/leads/:id/audit-trail', authenticateToken, async (req: any, res: Response) => {
+    const { id } = req.params;
+    try {
+      const lead = await db.select().from(schema.leads).where(eq(schema.leads.id, Number(id))).then(r => r[0] || null);
+      if (!lead) return res.status(404).json({ error: 'Lead not found' });
+      
+      if (req.user.role !== 'Admin' && lead.assignedUserId !== req.user.id && lead.pendingTechId !== req.user.id) {
+        return res.status(403).json({ error: 'Exclusive lead ownership violation: You do not have permission to view this lead\'s history.' });
+      }
+
+      const logs = await db.select({
+        id: schema.activityLogs.id,
+        action: schema.activityLogs.action,
+        details: schema.activityLogs.details,
+        createdAt: schema.activityLogs.createdAt,
+        userId: schema.activityLogs.userId,
+        username: schema.users.username,
+        userRole: schema.users.role,
+      })
+      .from(schema.activityLogs)
+      .leftJoin(schema.users, eq(schema.activityLogs.userId, schema.users.id))
+      .where(eq(schema.activityLogs.leadId, Number(id)))
+      .orderBy(desc(schema.activityLogs.createdAt));
+
+      res.json(logs);
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: 'Failed to fetch audit trail' });
     }
   });
 
@@ -934,10 +1265,11 @@ async function startServer() {
     try {
       const maxOrderQuery = await db.select({ maxOrder: sql<number>`max(${schema.pipelineStages.orderIndex})` }).from(schema.pipelineStages).then(res => res[0] || null);
       const nextOrder = (maxOrderQuery?.maxOrder !== null ? maxOrderQuery?.maxOrder : -1) + 1;
-      const newStage = await db.insert(schema.pipelineStages)
-        .values({ name, orderIndex: nextOrder })
-        .returning({ id: schema.pipelineStages.id, name: schema.pipelineStages.name, orderIndex: schema.pipelineStages.orderIndex })
-        .then(res => res[0] || null);
+      const [resObj] = await db.insert(schema.pipelineStages).values({ name, orderIndex: nextOrder });
+      const newStage = await db.select({ id: schema.pipelineStages.id, name: schema.pipelineStages.name, orderIndex: schema.pipelineStages.orderIndex })
+        .from(schema.pipelineStages)
+        .where(eq(schema.pipelineStages.id, (resObj as any).insertId))
+        .then((r: any) => r[0] || null);
       res.json(newStage);
     } catch (error) {
       console.error(error);
@@ -1066,6 +1398,14 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
   app.get('/api/leads/:id/whatsapp', authenticateToken, async (req: any, res) => {
     const { id } = req.params;
     try {
+      const lead = await db.select().from(schema.leads).where(eq(schema.leads.id, Number(id))).then(r => r[0] || null);
+      if (!lead) return res.status(404).json({ error: 'Lead not found' });
+      
+      // Exclusive Lead Ownership
+      if (req.user.role !== 'Admin' && lead.assignedUserId !== req.user.id && lead.pendingTechId !== req.user.id) {
+        return res.status(403).json({ error: 'Exclusive lead ownership violation: You do not have permission to view WhatsApp messages for this lead.' });
+      }
+
       const messages = await db.select()
         .from(schema.whatsappMessages)
         .where(eq(schema.whatsappMessages.leadId, Number(id)))
@@ -1082,14 +1422,24 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     const { id } = req.params;
     const { message, sender } = req.body;
     try {
-      const newMessage = await db.insert(schema.whatsappMessages)
+      const lead = await db.select().from(schema.leads).where(eq(schema.leads.id, Number(id))).then(r => r[0] || null);
+      if (!lead) return res.status(404).json({ error: 'Lead not found' });
+      
+      // Exclusive Lead Ownership
+      if (req.user.role !== 'Admin' && lead.assignedUserId !== req.user.id && lead.pendingTechId !== req.user.id) {
+        return res.status(403).json({ error: 'Exclusive lead ownership violation: You do not have permission to send WhatsApp messages for this lead.' });
+      }
+
+      const [resObj] = await db.insert(schema.whatsappMessages)
         .values({
           leadId: Number(id),
           sender: sender || 'user',
           message: message
-        })
-        .returning()
-        .then(res => res[0] || null);
+        });
+      const newMessage = await db.select()
+        .from(schema.whatsappMessages)
+        .where(eq(schema.whatsappMessages.id, (resObj as any).insertId))
+        .then((r: any) => r[0] || null);
         
       res.json(newMessage);
     } catch (error) {
@@ -1098,9 +1448,9 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     }
   });
 
-  // ----- Attendance & Tasks API -----
+  // ----- Attendance & Daily Activity Tracking API -----
   
-  // Punch In (called automatically on dashboard load or manual button)
+  // Punch In (called automatically on login or via dashboard action)
   app.post('/api/attendance/punch-in', authenticateToken, async (req: any, res) => {
     const userId = req.user.id;
     const date = new Date().toISOString().split('T')[0];
@@ -1114,11 +1464,13 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
       }
       
       const punchInTime = new Date().toISOString();
-      const newRecord = await db.insert(schema.attendance)
-        .values({ userId, date, punchIn: punchInTime })
-        .returning() // Return all fields of the newly inserted row
-        .then(res => res[0] || null);
+      const [resObj] = await db.insert(schema.attendance).values({ userId, date, punchIn: punchInTime });
+      const newRecord = await db.select()
+        .from(schema.attendance)
+        .where(eq(schema.attendance.id, (resObj as any).insertId))
+        .then((r: any) => r[0] || null);
       
+      await logAudit(userId, 'Punch In', 'Punched in for work shift');
       res.json({ success: true, data: newRecord });
     } catch (error) {
       console.error(error);
@@ -1134,13 +1486,14 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     try {
       await db.update(schema.attendance)
         .set({ punchOut: punchOutTime })
-        .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)))
-        ;
+        .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)));
       
       const updatedRecord = await db.select()
         .from(schema.attendance)
         .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)))
         .then(res => res[0] || null);
+
+      await logAudit(userId, 'Punch Out', 'Punched out from work shift');
       res.json({ success: true, data: updatedRecord });
     } catch (error) {
       console.error(error);
@@ -1156,12 +1509,78 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     try {
       await db.update(schema.attendance)
         .set({ notes: notes })
-        .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)))
-        ;
+        .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)));
       res.json({ success: true });
     } catch (error) {
       console.error(error);
       res.status(500).json({ error: 'Failed to save notes' });
+    }
+  });
+
+  // Get Today's Attendance & Activity Summary for Current User
+  app.get('/api/attendance/summary', authenticateToken, async (req: any, res: Response) => {
+    const userId = req.user.id;
+    const date = new Date().toISOString().split('T')[0];
+    try {
+      const attendance = await db.select()
+        .from(schema.attendance)
+        .where(and(eq(schema.attendance.userId, userId), eq(schema.attendance.date, date)))
+        .then(res => res[0] || null);
+
+      // Tasks for today
+      const tasks = await db.select()
+        .from(schema.tasks)
+        .where(and(eq(schema.tasks.userId, userId), eq(schema.tasks.date, date)))
+        .orderBy(asc(schema.tasks.id));
+
+      // User's assigned leads
+      const userLeads = await db.select()
+        .from(schema.leads)
+        .where(
+          and(
+            req.user.role === 'Admin' ? eq(schema.leads.isArchived, 0) : eq(schema.leads.assignedUserId, userId),
+            eq(schema.leads.isArchived, 0)
+          )
+        );
+
+      const overdueLeads: any[] = [];
+      const dueTodayLeads: any[] = [];
+
+      for (const l of userLeads) {
+        if (!l.nextFollowUp || ['Closed', 'Closed-Lost', 'Installed'].includes(l.status || '')) continue;
+        const fDate = l.nextFollowUp.split('T')[0];
+        if (fDate < date) {
+          overdueLeads.push(l);
+        } else if (fDate === date) {
+          dueTodayLeads.push(l);
+        }
+      }
+
+      // Count completed follow-ups today (activity logs for notes or stage updates by this user today)
+      const logsToday = await db.select({
+        leadId: schema.activityLogs.leadId
+      }).from(schema.activityLogs)
+        .where(
+          and(
+            eq(schema.activityLogs.userId, userId),
+            sql`DATE(${schema.activityLogs.createdAt}) = ${date}`
+          )
+        );
+
+      const distinctLeadsHandledToday = new Set(logsToday.map(l => l.leadId).filter(Boolean)).size;
+
+      res.json({
+        attendance,
+        tasks,
+        overdueCount: overdueLeads.length,
+        dueTodayCount: dueTodayLeads.length,
+        completedFollowUpsToday: distinctLeadsHandledToday,
+        overdueLeads: overdueLeads.slice(0, 10),
+        dueTodayLeads: dueTodayLeads.slice(0, 10),
+      });
+    } catch (e) {
+      console.error(e);
+      res.status(500).json({ error: 'Failed to fetch attendance summary' });
     }
   });
 
@@ -1177,8 +1596,7 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
       const tasks = await db.select()
         .from(schema.tasks)
         .where(and(eq(schema.tasks.userId, userId), eq(schema.tasks.date, date)))
-        .orderBy(asc(schema.tasks.id))
-        ;
+        .orderBy(asc(schema.tasks.id));
       res.json({ attendance, tasks });
     } catch (error) {
       console.error(error);
@@ -1186,39 +1604,55 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     }
   });
 
-  // Get All Team Attendance for Today (Admin)
+  // Get All Team Attendance for Today (Admin Real-Time Monitoring Dashboard)
   app.get('/api/attendance/all', authenticateToken, requireRole(['Admin']), async (req: any, res) => {
     const date = new Date().toISOString().split('T')[0];
     try {
-      // Get all users except admin (or include admin too, up to preference)
       const allUsers = await db.select({
-          id: schema.users.id,
-          username: schema.users.username,
-          role: schema.users.role
-        }).from(schema.users);
+        id: schema.users.id,
+        username: schema.users.username,
+        role: schema.users.role
+      }).from(schema.users);
       
-      // Get all attendance records for today
       const attendanceRecords = await db.select()
         .from(schema.attendance)
-        .where(eq(schema.attendance.date, date))
-        ;
+        .where(eq(schema.attendance.date, date));
       
-      // Get all tasks for today
       const tasks = await db.select()
         .from(schema.tasks)
-        .where(eq(schema.tasks.date, date))
-        ;
+        .where(eq(schema.tasks.date, date));
+
+      // Get count of actions performed today per user
+      const todayLogs = await db.select({
+        userId: schema.activityLogs.userId,
+        count: sql`count(*)`.mapWith(Number)
+      }).from(schema.activityLogs)
+        .where(sql`DATE(${schema.activityLogs.createdAt}) = ${date}`)
+        .groupBy(schema.activityLogs.userId);
       
       const result = allUsers.map((user: any) => {
         const userAttendance = attendanceRecords.find((a: any) => a.userId === user.id);
         const userTasks = tasks.filter((t: any) => t.userId === user.id);
         const completedTasks = userTasks.filter((t: any) => t.completed).length;
+        const userLog = todayLogs.find((l: any) => l.userId === user.id);
         
+        let status = 'Absent';
+        let activeMinutes = 0;
+        if (userAttendance && userAttendance.punchIn) {
+          const startTime = new Date(userAttendance.punchIn).getTime();
+          const endTime = userAttendance.punchOut ? new Date(userAttendance.punchOut).getTime() : Date.now();
+          activeMinutes = Math.max(0, Math.floor((endTime - startTime) / 60000));
+          status = userAttendance.punchOut ? 'Punched Out' : 'Active (Punched In)';
+        }
+
         return {
           user,
+          status,
           attendance: userAttendance || null,
+          activeMinutes,
           totalTasks: userTasks.length,
-          completedTasks
+          completedTasks,
+          activityCount: userLog?.count || 0
         };
       });
       
@@ -1235,10 +1669,11 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
     const date = new Date().toISOString().split('T')[0];
     const { text } = req.body;
     try {
-      const newTask = await db.insert(schema.tasks)
-        .values({ userId, date, text, completed: 0 })
-        .returning() // Return all fields
-        .then(res => res[0] || null);
+      const [resObj] = await db.insert(schema.tasks).values({ userId, date, text, completed: 0 });
+      const newTask = await db.select()
+        .from(schema.tasks)
+        .where(eq(schema.tasks.id, (resObj as any).insertId))
+        .then((r: any) => r[0] || null);
       res.json(newTask);
     } catch (error) {
       console.error(error);
@@ -1352,17 +1787,27 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
 
   // Socket Auth Middleware
   io.use((socket, next) => {
-    // Parse cookies from headers
-    const cookieHeader = socket.request.headers.cookie;
-    if (!cookieHeader) return next(new Error('Authentication error: No cookies'));
+    // 1. Check handshake auth token
+    let token = socket.handshake.auth?.token;
+
+    // 2. Check authorization header
+    if (!token && socket.handshake.headers.authorization) {
+      const parts = socket.handshake.headers.authorization.split(' ');
+      if (parts.length === 2 && parts[0] === 'Bearer') {
+        token = parts[1];
+      }
+    }
+
+    // 3. Parse cookies from headers
+    if (!token && socket.request.headers.cookie) {
+      const cookieHeader = socket.request.headers.cookie;
+      const tokenMatch = cookieHeader.match(/(?:^|;\s*)token=([^;]*)/);
+      token = tokenMatch ? tokenMatch[1] : null;
+    }
     
-    // Quick parser for token
-    const tokenMatch = cookieHeader.match(/(?:^|;\s*)token=([^;]*)/);
-    const token = tokenMatch ? tokenMatch[1] : null;
-    
-    if (!token) return next(new Error('Authentication error: No token'));
+    if (!token) return next(new Error('Authentication error: No token provided'));
     jwt.verify(token, JWT_SECRET, (err: any, decoded: any) => {
-      if (err) return next(new Error('Authentication error: Invalid token'));
+      if (err) return next(new Error('Authentication error: Invalid or expired token'));
       socket.data.user = decoded;
       next();
     });
@@ -1376,10 +1821,14 @@ The message should be polite, action-oriented, use minimal appropriate emojis, a
 
     socket.on('send_chat_message', async (data) => {
       try {
-        const [inserted] = await db.insert(schema.chatMessages).values({
+        const [resObj] = await db.insert(schema.chatMessages).values({
           userId: user.id,
           message: data.message,
-        }).returning();
+        });
+        const inserted = await db.select()
+          .from(schema.chatMessages)
+          .where(eq(schema.chatMessages.id, (resObj as any).insertId))
+          .then((r: any) => r[0]);
 
         // Broadcast to all
         io.emit('new_chat_message', {

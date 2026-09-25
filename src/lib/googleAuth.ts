@@ -68,8 +68,8 @@ export const syncLeadToGoogleCalendar = async (lead: any) => {
   if (lead.visitSchedule) {
     eventsToSync.push({
       summary: `[Site Visit] ${lead.clientName}`,
-      description: `Phone: ${lead.phone}\nAddress: ${lead.address}`,
-      location: lead.address,
+      description: `Phone: ${lead.contact || lead.phone || 'N/A'}\nAddress: ${lead.address || 'N/A'}`,
+      location: lead.address || '',
       start: { date: new Date(lead.visitSchedule).toISOString().split('T')[0] },
       end: { date: new Date(lead.visitSchedule).toISOString().split('T')[0] }
     });
@@ -78,8 +78,8 @@ export const syncLeadToGoogleCalendar = async (lead: any) => {
   if (lead.installationSchedule) {
     eventsToSync.push({
       summary: `[Installation] ${lead.clientName}`,
-      description: `Phone: ${lead.phone}\nAddress: ${lead.address}`,
-      location: lead.address,
+      description: `Phone: ${lead.contact || lead.phone || 'N/A'}\nAddress: ${lead.address || 'N/A'}`,
+      location: lead.address || '',
       start: { date: new Date(lead.installationSchedule).toISOString().split('T')[0] },
       end: { date: new Date(lead.installationSchedule).toISOString().split('T')[0] }
     });
@@ -88,7 +88,7 @@ export const syncLeadToGoogleCalendar = async (lead: any) => {
   if (lead.nextFollowUp) {
     eventsToSync.push({
       summary: `[Follow-up] ${lead.clientName}`,
-      description: `Phone: ${lead.phone}`,
+      description: `Phone: ${lead.contact || lead.phone || 'N/A'}`,
       start: { date: new Date(lead.nextFollowUp).toISOString().split('T')[0] },
       end: { date: new Date(lead.nextFollowUp).toISOString().split('T')[0] }
     });

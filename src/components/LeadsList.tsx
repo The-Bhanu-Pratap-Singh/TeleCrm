@@ -1,7 +1,12 @@
 import { syncLeadToGoogleCalendar } from '../lib/googleAuth.ts';
 import React, { useEffect, useState, useRef } from 'react';
 import type { User, Lead, LeadStatus } from '../types.ts';
-import { Plus, X, Edit, MessageSquare, Bot, Loader2, Search, Download, History, CalendarClock, LayoutGrid, List as ListIcon, CheckCircle2, FileText, Flame, Upload, ChevronDown, ChevronUp, Save, Printer, MapPin } from 'lucide-react';
+import { 
+  Plus, X, Edit, MessageSquare, Bot, Loader2, Search, Download, History, 
+  CalendarClock, LayoutGrid, List as ListIcon, CheckCircle2, FileText, Flame, 
+  Upload, ChevronDown, ChevronUp, Save, Printer, MapPin, Lock, ShieldCheck,
+  UserCheck, Clock
+} from 'lucide-react';
 import KanbanBoard from './KanbanBoard.tsx';
 import WhatsappChatDrawer from './WhatsappChatDrawer';
 import type { PipelineStage } from '../types.ts';
@@ -13,6 +18,11 @@ export default function LeadsList({ user, token }: { user: User, token: string }
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isChatOpen, setIsChatOpen] = useState(false);
   const [editingLead, setEditingLead] = useState<Partial<Lead> | null>(null);
+  const [originalAssigneeId, setOriginalAssigneeId] = useState<number | null>(null);
+  const [reassignmentReason, setReassignmentReason] = useState('');
+  const [activeModalTab, setActiveModalTab] = useState<'details' | 'audit'>('details');
+  const [auditLogs, setAuditLogs] = useState<any[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
   const [aiScript, setAiScript] = useState('');
   const [aiLoading, setAiLoading] = useState(false);
   const [users, setUsers] = useState<Partial<User>[]>([]);
@@ -37,8 +47,44 @@ export default function LeadsList({ user, token }: { user: User, token: string }
   const [selectedLeadIds, setSelectedLeadIds] = useState<number[]>([]);
   const [bulkAssignUserId, setBulkAssignUserId] = useState<number | ''>('');
   const [bulkStatus, setBulkStatus] = useState<LeadStatus | ''>('');
+  const [bulkTechId, setBulkTechId] = useState<string>('');
   const [bulkAssignLoading, setBulkAssignLoading] = useState(false);
   const [bulkAssignSuccess, setBulkAssignSuccess] = useState('');
+
+  const isSlaBreached = (lead: Lead) => {
+    if (lead.techAssignmentStatus !== 'Pending' || !lead.techAssignedAt) return false;
+    const assignedTime = new Date(lead.techAssignedAt).getTime();
+    const thirtyMins = 30 * 60 * 1000;
+    return Date.now() - assignedTime > thirtyMins;
+  };
+
+  const handleBulkUpdate = async () => {
+    if (selectedLeadIds.length === 0) return;
+    setBulkAssignLoading(true);
+    try {
+      const res = await fetch('/api/leads/bulk-update', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leadIds: selectedLeadIds,
+          status: bulkStatus || undefined,
+          pendingTechId: bulkTechId ? Number(bulkTechId) : undefined,
+        }),
+      });
+      if (res.ok) {
+        setBulkAssignSuccess('Updated selected leads');
+        setTimeout(() => setBulkAssignSuccess(''), 3000);
+        setSelectedLeadIds([]);
+        setBulkStatus('');
+        setBulkTechId('');
+        fetchLeads();
+      }
+    } catch (e) {
+      console.error('Bulk update error:', e);
+    } finally {
+      setBulkAssignLoading(false);
+    }
+  };
 
   const [isNoteModalOpen, setIsNoteModalOpen] = useState(false);
   const [noteLeadId, setNoteLeadId] = useState<number | null>(null);
@@ -73,7 +119,10 @@ export default function LeadsList({ user, token }: { user: User, token: string }
             body: JSON.stringify({ notes: expandedNoteText })
           });
           if (res.ok) {
-            setLeads(prev => prev.map(l => l.id === expandedNotesId ? { ...l, notes: expandedNoteText } : l));
+            setLeads(prev => prev.map(l => l.id === expandedNotesId ? {
+              ...l,
+              notes: [{ text: expandedNoteText, timestamp: new Date().toISOString(), author: user?.username || 'User' }]
+            } : l));
           }
         } catch (e) {
           console.error(e);
@@ -370,18 +419,27 @@ export default function LeadsList({ user, token }: { user: User, token: string }
     const method = payload.id ? 'PUT' : 'POST';
 
     try {
-      await fetch(url, {
+      const res = await fetch(url, {
         method,
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${token}`
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({
+          ...payload,
+          reassignmentReason: reassignmentReason || undefined
+        })
       });
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        alert(errData.error || 'Failed to save lead');
+        return;
+      }
       setIsModalOpen(false);
       fetchLeads();
     } catch (err) {
       console.error(err);
+      alert('Error connecting to server');
     }
   };
 
@@ -417,9 +475,30 @@ export default function LeadsList({ user, token }: { user: User, token: string }
     }
   };
 
+  const fetchAuditLogs = async (leadId: number) => {
+    try {
+      setAuditLoading(true);
+      const res = await fetch(`/api/leads/${leadId}/audit-trail`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setAuditLogs(data);
+      }
+    } catch (e) {
+      console.error('Failed to fetch audit trail:', e);
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
   const openModal = (lead?: Lead) => {
     const newEditingLead = lead ? { ...lead } : { status: 'New', notes: [] };
     setEditingLead(newEditingLead);
+    setOriginalAssigneeId(lead?.assignedUserId || null);
+    setReassignmentReason('');
+    setActiveModalTab('details');
+    setAuditLogs([]);
     lastSavedLeadRef.current = JSON.stringify(newEditingLead);
     setLastSaved(null);
     setIsSaving(false);
@@ -427,6 +506,9 @@ export default function LeadsList({ user, token }: { user: User, token: string }
     setNewNextFollowUp('');
     setAiScript('');
     setIsModalOpen(true);
+    if (lead?.id) {
+      fetchAuditLogs(lead.id);
+    }
   };
 
   
@@ -1125,12 +1207,42 @@ export default function LeadsList({ user, token }: { user: User, token: string }
         <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4 z-50 overflow-y-auto">
           <div className="bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 rounded-2xl shadow-xl border border-zinc-200 dark:border-zinc-800 max-w-3xl w-full max-h-[92vh] flex flex-col overflow-hidden my-auto transition-colors">
             <div className="flex justify-between items-center px-4 sm:px-6 py-4 border-b border-zinc-100 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-850 dark:bg-zinc-800/50 flex-shrink-0">
-              <div className="flex items-center gap-4">
+              <div className="flex items-center gap-3 sm:gap-4 flex-wrap">
                 <h3 className="text-base sm:text-lg font-bold text-zinc-900 dark:text-white">
                   {editingLead.id ? 'Edit Lead' : 'New Lead'}
                 </h3>
                 {editingLead.id && (
-                  <div className="flex items-center gap-1.5 text-xs font-medium">
+                  <div className="flex items-center bg-zinc-200/60 dark:bg-zinc-800 p-0.5 rounded-lg border border-zinc-300/50 dark:border-zinc-700/50">
+                    <button
+                      type="button"
+                      onClick={() => setActiveModalTab('details')}
+                      className={`px-3 py-1 rounded-md text-xs font-semibold transition-colors ${
+                        activeModalTab === 'details' 
+                          ? 'bg-white dark:bg-zinc-700 text-zinc-900 dark:text-white shadow-xs' 
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      }`}
+                    >
+                      Lead Details
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setActiveModalTab('audit');
+                        if (editingLead.id) fetchAuditLogs(editingLead.id);
+                      }}
+                      className={`px-3 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                        activeModalTab === 'audit' 
+                          ? 'bg-white dark:bg-zinc-700 text-indigo-600 dark:text-indigo-400 shadow-xs' 
+                          : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-200'
+                      }`}
+                    >
+                      <ShieldCheck className="w-3.5 h-3.5" />
+                      <span>Audit Trail ({auditLogs.length})</span>
+                    </button>
+                  </div>
+                )}
+                {editingLead.id && (
+                  <div className="hidden sm:flex items-center gap-1.5 text-xs font-medium">
                     {isSaving ? (
                       <span className="text-indigo-500 dark:text-indigo-400 flex items-center gap-1.5">
                         <Loader2 className="w-3.5 h-3.5 animate-spin" /> Saving...
@@ -1151,6 +1263,90 @@ export default function LeadsList({ user, token }: { user: User, token: string }
               </button>
             </div>
             
+            {activeModalTab === 'audit' ? (
+              <div className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-4">
+                <div className="p-3 bg-zinc-50 dark:bg-zinc-850 border border-zinc-200 dark:border-zinc-800 rounded-xl flex items-center gap-2.5 text-xs text-zinc-600 dark:text-zinc-400">
+                  <ShieldCheck className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                  <span>
+                    <strong>Immutable Audit Trail:</strong> Every action, stage change, hand-off reason, price negotiation, and schedule is permanently recorded and cannot be altered or deleted.
+                  </span>
+                </div>
+
+                {auditLoading ? (
+                  <div className="py-12 flex flex-col items-center justify-center gap-2 text-zinc-400">
+                    <Loader2 className="w-6 h-6 animate-spin text-indigo-500" />
+                    <span className="text-xs">Loading audit trail...</span>
+                  </div>
+                ) : auditLogs.length === 0 ? (
+                  <div className="py-12 text-center text-zinc-400 text-xs">
+                    No audit records found for this lead.
+                  </div>
+                ) : (
+                  <div className="relative pl-6 space-y-5 before:absolute before:left-2.5 before:top-2 before:bottom-2 before:w-0.5 before:bg-zinc-200 dark:before:bg-zinc-800">
+                    {auditLogs.map((log, index) => {
+                      const isReassignment = log.action.includes('Reassigned') || log.action.includes('Assignment');
+                      const isStage = log.action.includes('Stage');
+                      const isPrice = log.action.includes('Price');
+                      const isSla = log.action.includes('SLA') || log.action.includes('Escalat');
+
+                      const badgeColor = isReassignment
+                        ? 'bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300 border-amber-200 dark:border-amber-800'
+                        : isStage
+                        ? 'bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300 border-blue-200 dark:border-blue-800'
+                        : isPrice
+                        ? 'bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                        : isSla
+                        ? 'bg-rose-100 text-rose-800 dark:bg-rose-950 dark:text-rose-300 border-rose-200 dark:border-rose-800'
+                        : 'bg-zinc-100 text-zinc-800 dark:bg-zinc-800 dark:text-zinc-300 border-zinc-200 dark:border-zinc-700';
+
+                      return (
+                        <div key={log.id || index} className="relative group">
+                          {/* Timeline dot */}
+                          <div className={`absolute -left-6 top-1.5 w-3 h-3 rounded-full border-2 border-white dark:border-zinc-900 ${
+                            isSla ? 'bg-rose-500' : isReassignment ? 'bg-amber-500' : isStage ? 'bg-blue-500' : isPrice ? 'bg-emerald-500' : 'bg-indigo-500'
+                          }`}></div>
+
+                          <div className="bg-zinc-50 dark:bg-zinc-800/60 p-3.5 rounded-xl border border-zinc-200/80 dark:border-zinc-750">
+                            <div className="flex flex-wrap items-center justify-between gap-2 mb-1.5">
+                              <div className="flex items-center gap-2">
+                                <span className={`px-2 py-0.5 rounded text-[11px] font-semibold border ${badgeColor}`}>
+                                  {log.action}
+                                </span>
+                                <span className="text-xs font-semibold text-zinc-900 dark:text-zinc-100">
+                                  {log.username || 'System'}
+                                  {log.userRole && (
+                                    <span className="text-[10px] text-zinc-400 font-normal ml-1">
+                                      ({log.userRole})
+                                    </span>
+                                  )}
+                                </span>
+                              </div>
+                              <span className="text-[11px] text-zinc-400 font-mono flex items-center gap-1">
+                                <Clock className="w-3 h-3" />
+                                {new Date(log.createdAt).toLocaleString()}
+                              </span>
+                            </div>
+                            <p className="text-xs text-zinc-700 dark:text-zinc-300 leading-relaxed font-sans">
+                              {log.details}
+                            </p>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="pt-4 border-t border-zinc-200 dark:border-zinc-800 flex justify-end">
+                  <button
+                    type="button"
+                    onClick={() => setActiveModalTab('details')}
+                    className="px-4 py-2 text-xs font-semibold text-indigo-600 dark:text-indigo-400 bg-indigo-50 dark:bg-indigo-950/50 hover:bg-indigo-100 rounded-lg transition-colors"
+                  >
+                    &larr; Back to Details
+                  </button>
+                </div>
+              </div>
+            ) : (
             <form onSubmit={handleSave} className="p-4 sm:p-6 overflow-y-auto flex-1 space-y-6">
               {editingLead.id && (editingLead.notes?.length || editingLead.nextFollowUp || editingLead.installationSchedule) ? (
                 <div className="mb-6 p-4 bg-blue-50/50 dark:bg-blue-950/30 border border-blue-100 dark:border-blue-900/50 rounded-xl">
@@ -1348,11 +1544,24 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                           onChange={e => setNewNextFollowUp(e.target.value)}
                         />
                       </div>
-                      {(user.role === 'Admin' || user.role === 'Social Media Manager' || user.role === 'Telecaller') && (
+                      {(user.role === 'Admin' || (!editingLead.id && (user.role === 'Social Media Manager' || user.role === 'Telecaller'))) && (
                         <div>
-                          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1">Assign To</label>
+                          <label className="block text-xs font-medium text-zinc-700 dark:text-zinc-300 mb-1 flex items-center justify-between">
+                            <span>Assign To</span>
+                            {editingLead.id && user.role !== 'Admin' && (
+                              <span className="text-[10px] text-zinc-400 font-normal flex items-center gap-1">
+                                <Lock className="w-3 h-3" /> Locked (Admin Only)
+                              </span>
+                            )}
+                            {editingLead.id && user.role === 'Admin' && (
+                              <span className="text-[10px] text-amber-600 dark:text-amber-400 font-semibold flex items-center gap-1">
+                                <ShieldCheck className="w-3 h-3" /> Admin Reassignment
+                              </span>
+                            )}
+                          </label>
                           <select
-                            className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-lg text-xs sm:text-sm bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 focus:ring-2 focus:ring-indigo-500 focus:outline-none"
+                            disabled={Boolean(editingLead.id && user.role !== 'Admin')}
+                            className="w-full px-3 py-2 border border-zinc-300 dark:border-zinc-700 rounded-lg text-xs sm:text-sm bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 disabled:bg-zinc-100 dark:disabled:bg-zinc-800/60 disabled:cursor-not-allowed focus:ring-2 focus:ring-indigo-500 focus:outline-none"
                             value={editingLead.assignedUserId || ''}
                             onChange={e => setEditingLead({...editingLead, assignedUserId: Number(e.target.value)})}
                           >
@@ -1361,6 +1570,23 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                               <option key={u.id} value={u.id}>{u.username} ({u.role})</option>
                             ))}
                           </select>
+                        </div>
+                      )}
+
+                      {/* Admin Reassignment Reason Input */}
+                      {user.role === 'Admin' && editingLead.id && Number(editingLead.assignedUserId) !== Number(originalAssigneeId) && (
+                        <div className="sm:col-span-2 p-3 bg-amber-50/70 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800/70 rounded-xl space-y-1">
+                          <label className="block text-xs font-semibold text-amber-900 dark:text-amber-200">
+                            Reason for Reassignment (Required for Immutable Audit Trail)
+                          </label>
+                          <input 
+                            type="text"
+                            required
+                            placeholder="e.g. Telecaller on leave, workload balancing, regional territory shift"
+                            className="w-full px-3 py-1.5 border border-amber-300 dark:border-amber-700 bg-white dark:bg-zinc-900 text-zinc-900 dark:text-zinc-100 rounded-lg text-xs focus:ring-2 focus:ring-amber-500 focus:outline-none"
+                            value={reassignmentReason}
+                            onChange={e => setReassignmentReason(e.target.value)}
+                          />
                         </div>
                       )}
                     </div>
@@ -1409,6 +1635,7 @@ export default function LeadsList({ user, token }: { user: User, token: string }
                 </button>
               </div>
             </form>
+            )}
           </div>
         </div>
       )}
